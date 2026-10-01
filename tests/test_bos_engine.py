@@ -50,6 +50,13 @@ def revaluating_snap(tf=M5):
                              b.active_swing_low, b.prior_swing_low)
 
 
+def level(k, tf=M5):
+    """BULLISH snapshot whose active high (12) is a DIFFERENT swing for every k."""
+    return StructureSnapshot(tf, S.BULLISH,
+                             sw(HIGH, 12, 2 + k, tf, 2 + k), sw(HIGH, 10, 0, tf, 0),
+                             sw(LOW, 6, 3, tf, 3), sw(LOW, 4, 1, tf, 1))
+
+
 def cd(i, o, h, l, c, tf=M5):
     return Candle(tf, T0 + (20 + i) * tf.duration, o, h, l, c)
 
@@ -133,13 +140,55 @@ def test_no_bos_in_undetermined_or_revaluating():
         assert e.history == ()
 
 
-def test_every_qualifying_close_is_its_own_bos():
+def test_only_the_first_close_beyond_an_unchanged_level_is_a_bos():
     e, snap = BOSEngine(M5), bull_snap()
     events = [run(e, cd(i, 12.5, 20, 12.2, 13 + i), snap) for i in range(3)]
-    assert all(isinstance(b, BOS) for b in events)
-    assert len({b.candle_time for b in events}) == 3
-    assert all(b.broken_swing is snap.active_swing_high for b in events)
-    assert e.history == tuple(events)
+    assert isinstance(events[0], BOS) and events[0].broken_swing is snap.active_swing_high
+    assert events[1] is None and events[2] is None
+    assert e.history == (events[0],)
+    # Mirror: BEARISH, the same unchanged active low.
+    e, snap = BOSEngine(M5), bear_snap()
+    events = [run(e, cd(i, 3.5, 3.8, 0, 3 - i), snap) for i in range(3)]
+    assert isinstance(events[0], BOS) and events[0].direction is BEAR
+    assert events[1] is None and events[2] is None
+    assert e.history == (events[0],)
+
+
+def test_a_new_structural_level_permits_a_new_bos():
+    e = BOSEngine(M5)
+    first = run(e, cd(0, 12.5, 20, 12.2, 13), bull_snap())
+    assert run(e, cd(1, 12.5, 20, 12.2, 13.5), bull_snap()) is None       # same level
+    # A newly confirmed swing high (13) becomes the active level.
+    newer = StructureSnapshot(M5, S.BULLISH, sw(HIGH, 13, 4, M5, 4), bull_snap().active_swing_high,
+                              bull_snap().active_swing_low, bull_snap().prior_swing_low)
+    second = run(e, cd(2, 13.2, 20, 13.1, 14), newer)
+    assert second is not None and second.broken_swing is newer.active_swing_high
+    assert run(e, cd(3, 13.2, 20, 13.1, 15), newer) is None               # new level, also one BOS
+    assert e.history == (first, second)
+
+
+def test_dedupe_is_per_direction():
+    e = BOSEngine(M5)
+    assert run(e, cd(0, 12.5, 20, 12.2, 13), bull_snap()).direction is BULL
+    assert run(e, cd(1, 3.5, 3.8, 0, 3), bear_snap()).direction is BEAR
+    assert len(e.history) == 2
+
+
+def test_dedupe_memory_survives_revaluating_and_restoration():
+    e = BOSEngine(M5)
+    first = run(e, cd(0, 12.5, 20, 12.2, 13), bull_snap())
+    assert first is not None
+    assert run(e, cd(1, 12.5, 20, 12.2, 13.5), revaluating_snap()) is None   # REVALUATING: no BOS
+    assert run(e, cd(2, 12.5, 20, 12.2, 14), bull_snap()) is None             # restored, same level
+    assert e.history == (first,)
+
+
+def test_rejected_candle_does_not_update_the_dedupe_memory():
+    e, snap = BOSEngine(M5), bull_snap()
+    good = cd(0, 12.5, 20, 12.2, 13)
+    with pytest.raises(ValueError):
+        e.process_candle(good, good.open_time, snap)                 # unfinished: rejected
+    assert run(e, good, snap) is not None                            # the level was never consumed
 
 
 def test_engine_evaluates_against_the_snapshot_it_is_given():
@@ -152,19 +201,19 @@ def test_engine_evaluates_against_the_snapshot_it_is_given():
     assert run(BOSEngine(M5), candle, newer) is None
 
 
-# ---------------------------------------------------------------- CHOCH-only rule (Option A)
-def test_no_bos_when_the_candle_also_breaks_the_protected_low():
-    # close 13 > 12 (BOS condition) but low 5 < protected low 6 (CHOCH condition).
+# ---------------------------------------------------------------- no opposite-wick exclusion
+def test_an_opposite_wick_below_the_protected_low_does_not_suppress_the_bos():
+    # close 13 > 12 (BOS); low 5 < protected low 6 is only a wick, not a close.
     e = BOSEngine(M5)
-    assert run(e, cd(0, 12, 14, 5, 13), bull_snap()) is None
-    assert e.history == ()
+    bos = run(e, cd(0, 12, 14, 5, 13), bull_snap())
+    assert bos is not None and bos.direction is BULL and e.history == (bos,)
 
 
-def test_no_bos_when_the_candle_also_breaks_the_protected_high():
-    # close 3 < 4 (BOS condition) but high 11 > protected high 10 (CHOCH condition).
+def test_an_opposite_wick_above_the_protected_high_does_not_suppress_the_bos():
+    # close 3 < 4 (BOS); high 11 > protected high 10 is only a wick, not a close.
     e = BOSEngine(M5)
-    assert run(e, cd(0, 5, 11, 2, 3), bear_snap()) is None
-    assert e.history == ()
+    bos = run(e, cd(0, 5, 11, 2, 3), bear_snap())
+    assert bos is not None and bos.direction is BEAR and e.history == (bos,)
 
 
 def test_touching_the_protected_swing_exactly_does_not_suppress_the_bos():
@@ -172,10 +221,10 @@ def test_touching_the_protected_swing_exactly_does_not_suppress_the_bos():
     assert run(BOSEngine(M5), cd(0, 5, 10, 2, 3), bear_snap()) is not None        # high == 10
 
 
-def test_suppression_does_not_affect_later_candles():
+def test_an_opposite_wick_bos_is_the_only_bos_of_its_level():
     e, snap = BOSEngine(M5), bull_snap()
-    assert run(e, cd(0, 12, 14, 5, 13), snap) is None
-    assert run(e, cd(1, 12.5, 14, 12.2, 13), snap) is not None
+    assert run(e, cd(0, 12, 14, 5, 13), snap) is not None
+    assert run(e, cd(1, 12.5, 14, 12.2, 13), snap) is None
 
 
 # ---------------------------------------------------------------- validation
@@ -242,9 +291,11 @@ def test_rejects_repeated_earlier_and_overlapping_candles():
 
 def test_accepts_gaps_and_back_to_back_candles():
     e, snap = BOSEngine(M5), bull_snap()
-    run(e, cd(0, 11, 13, 10, 12.5), snap)
-    run(e, cd(1, 11, 13, 10, 12.5), snap)                  # opens exactly at previous close
-    run(e, cd(500, 11, 13, 10, 12.5), snap)                # weekend-sized gap
+    run(e, cd(0, 11, 13, 10, 12.5), level(0))
+    run(e, cd(1, 11, 13, 10, 12.5), level(1))              # opens exactly at previous close
+    run(e, cd(500, 11, 13, 10, 12.5), level(2))            # weekend-sized gap
+    assert len(e.history) == 3                             # three different levels, three BOS
+    run(e, cd(501, 11, 13, 10, 12.5), level(2))            # accepted, but the level is already used
     assert len(e.history) == 3
 
 
@@ -293,11 +344,13 @@ def test_mixing_naive_and_aware_datetimes_raises_and_changes_nothing():
 
 def test_history_is_append_only_and_a_tuple():
     e, snap = BOSEngine(M5), bull_snap()
-    run(e, cd(0, 11, 13, 10, 12.5), snap)
+    run(e, cd(0, 11, 13, 10, 12.5), level(0))
     first = e.history
     assert isinstance(first, tuple)
-    run(e, cd(1, 11, 13, 10, 12.5), snap)
+    run(e, cd(1, 11, 13, 10, 12.5), level(1))
     assert e.history[:1] == first and len(e.history) == 2
+    run(e, cd(2, 11, 13, 10, 12.5), level(1))              # same level: nothing appended
+    assert e.history[:2] == e.history and len(e.history) == 2
 
 
 def test_every_timeframe_works():
@@ -358,13 +411,25 @@ def bullish_pipeline():
     return p
 
 
-def test_pipeline_bullish_bos_and_literal_repeat():
+def test_pipeline_bullish_bos_then_no_repeat_on_the_unchanged_level():
     p = bullish_pipeline()
     first = p.feed(14, 11.5)                     # close 12.75 > 12, low above protected low
-    second = p.feed(15, 12.5)                    # close 13.75 > 12, same active high
-    assert first.direction is BULL and second.direction is BULL
-    assert first.broken_swing is second.broken_swing is p.structure.snapshot.active_swing_high
-    assert len(p.bos.history) == 2
+    second = p.feed(15, 12.5)                    # close 13.75 > 12, same unchanged active high
+    assert first.direction is BULL and second is None
+    assert first.broken_swing is p.structure.snapshot.active_swing_high
+    assert len(p.bos.history) == 1
+
+
+def test_pipeline_a_new_structural_high_permits_a_new_bos():
+    p = bullish_pipeline()
+    first = p.feed(14, 11.5)                     # BOS of 12
+    assert p.feed(15, 12.5) is None              # same level
+    assert p.feed(14.5, 12.5) is None            # confirms swing high 15: new level, close 13.5 < 15
+    assert p.structure.snapshot.active_swing_high.price == 15
+    second = p.feed(17, 14)                      # close 15.5 > 15
+    assert second is not None and second.broken_swing.price == 15
+    assert [b.broken_swing.price for b in p.bos.history] == [12, 15]
+    assert first is p.bos.history[0] and p.structure.state is S.BULLISH
 
 
 def test_pipeline_wick_only_break_is_not_a_bos():
@@ -373,10 +438,11 @@ def test_pipeline_wick_only_break_is_not_a_bos():
     assert p.bos.history == ()
 
 
-def test_pipeline_choch_candle_emits_no_bos():
+def test_pipeline_opposite_wick_candle_still_emits_the_bos():
     p = bullish_pipeline()
-    assert p.feed(20, 5) is None                 # close 12.5 > 12 but low 5 < protected low 6
-    assert p.bos.history == ()
+    bos = p.feed(20, 5)                          # close 12.5 > 12; low 5 < 6 is only a wick
+    assert bos is not None and bos.direction is BULL and bos.close_price == 12.5
+    assert len(p.bos.history) == 1
 
 
 def test_pipeline_no_bos_after_the_structure_enters_revaluating():
@@ -387,17 +453,22 @@ def test_pipeline_no_bos_after_the_structure_enters_revaluating():
 
 
 class Reference:
-    """Plain restatement of the locked rules, evaluated from the snapshot."""
+    """Plain restatement of the locked rules: a close beyond the active level is a
+    BOS, once per structural swing (memory survives REVALUATING)."""
 
-    @staticmethod
-    def expected(snapshot, candle):
+    def __init__(self):
+        self.used = {}
+
+    def expected(self, snapshot, candle):
         if snapshot.state is S.BULLISH:
-            high, low = snapshot.active_swing_high, snapshot.active_swing_low
-            if candle.close > high.price and not candle.low < low.price:
+            high = snapshot.active_swing_high
+            if candle.close > high.price and self.used.get(BULL) != high.sequence:
+                self.used[BULL] = high.sequence
                 return (BULL, high.sequence, candle.open_time)
         if snapshot.state is S.BEARISH:
-            high, low = snapshot.active_swing_high, snapshot.active_swing_low
-            if candle.close < low.price and not candle.high > high.price:
+            low = snapshot.active_swing_low
+            if candle.close < low.price and self.used.get(BEAR) != low.sequence:
+                self.used[BEAR] = low.sequence
                 return (BEAR, low.sequence, candle.open_time)
         return None
 
@@ -407,6 +478,7 @@ def test_random_pipeline_matches_reference():
     for seed in range(60):
         rng = random.Random(seed)
         swing, structure, bos_engine = SwingEngine(M5), StructureEngine(M5), BOSEngine(M5)
+        ref = Reference()
         for i in range(100):
             high = rng.randint(5, 20)
             low = high - rng.randint(1, 6)
@@ -415,7 +487,7 @@ def test_random_pipeline_matches_reference():
             structure.process_swings(swing.process_candle(c, c.close_time))
             snap = structure.snapshot
             got = bos_engine.process_candle(c, c.close_time, snap)
-            want = Reference.expected(snap, c)
+            want = ref.expected(snap, c)
             if want is None:
                 assert got is None, (seed, i)
             else:

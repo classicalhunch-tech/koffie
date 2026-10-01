@@ -1,8 +1,22 @@
 """Candle model for Koffie Strategy 1 (spec sections 2, 3 and 15).
  
-This module defines only the data: the three timeframes, an immutable OHLCV
-candle, and facts derived directly from one candle's own values. It contains
-no strategy logic (no swings, no BRR/decisive test, no structure).
+This module defines the three timeframes, an immutable OHLCV candle, facts
+derived directly from one candle's own values, and the locked Strategy 1
+BRR candle classification. It contains no swing or structure logic.
+
+BRR classification (locked)
+---------------------------
+    BRR = abs(close - open) / (high - low)
+
+    high == low                 -> ZERO_RANGE_ANOMALY (never decisive)
+    BRR >  0.70, close > open   -> BULLISH_DECISIVE
+    BRR >  0.70, close < open   -> BEARISH_DECISIVE
+    BRR <= 0.70 (incl. exactly 0.70 and close == open) -> NEUTRAL
+
+The 0.70 default may be overridden via `classify(now, threshold=...)` for
+backtesting; the comparison stays strict. BRR alone decides; no ATR, size, wick, displacement or volatility filter.
+Only a fully CLOSED candle can be classified: `classify(now)` raises
+ValueError while `now < close_time`, so a forming candle can never be decisive.
  
 Timing
 ------
@@ -15,8 +29,23 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
- 
- 
+from typing import Optional
+
+
+BRR_DECISIVE_THRESHOLD = 0.70
+
+
+class CandleClass(Enum):
+    BULLISH_DECISIVE = "BULLISH_DECISIVE"
+    BEARISH_DECISIVE = "BEARISH_DECISIVE"
+    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.70
+    ZERO_RANGE_ANOMALY = "ZERO_RANGE_ANOMALY"  # high == low
+
+    @property
+    def is_decisive(self) -> bool:
+        return self in (CandleClass.BULLISH_DECISIVE, CandleClass.BEARISH_DECISIVE)
+
+
 class Timeframe(Enum):
     M5 = "5M"
     M15 = "15M"
@@ -91,4 +120,44 @@ class Candle:
  
     @property
     def is_doji(self) -> bool:
+        """Literal close == open ONLY. This is NOT the Strategy 1 "DOJI / NEUTRAL"
+        (BRR <= 0.70); use `classify(now)` for that."""
         return self.close == self.open
+
+    # -- BRR classification (locked Strategy 1 rule) ----------------------
+    @property
+    def brr(self) -> Optional[float]:
+        """abs(close - open) / (high - low), or None when high == low."""
+        if self.high == self.low:
+            return None
+        return abs(self.close - self.open) / (self.high - self.low)
+
+    def classify(
+        self, now: datetime, threshold: float = BRR_DECISIVE_THRESHOLD
+    ) -> CandleClass:
+        """Classify this candle. Only a fully closed candle may be classified.
+
+        Raises ValueError if the candle is not closed at `now` (TypeError if
+        `now` is not a datetime), so an unclosed candle is never decisive.
+
+        `threshold` defaults to the locked Strategy 1 value (0.70); it is
+        configurable only for future backtesting. The comparison is always
+        strict: BRR > threshold is decisive, BRR <= threshold is NEUTRAL.
+        It must be a finite number in [0, 1].
+        """
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise TypeError("threshold must be a number")
+        if not (math.isfinite(threshold) and 0.0 <= threshold <= 1.0):
+            raise ValueError("threshold must be a finite number between 0 and 1")
+        if not self.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be classified")
+        brr = self.brr
+        if brr is None:
+            return CandleClass.ZERO_RANGE_ANOMALY
+        if brr > threshold:
+            if self.close > self.open:
+                return CandleClass.BULLISH_DECISIVE
+            return CandleClass.BEARISH_DECISIVE   # close < open (close == open gives BRR 0)
+        return CandleClass.NEUTRAL

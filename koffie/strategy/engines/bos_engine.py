@@ -8,17 +8,18 @@ candle and the current StructureSnapshot.
     UNDETERMINED / REVALUATING: no BOS is emitted (spec defines BOS only for
     bullish and bearish markets).
 
-Only the CLOSE counts; a wick beyond the level is not a BOS. Every qualifying
-close is its own BOS event (a repeated close beyond the same level emits again).
+Only the CLOSE counts; a wick beyond the level is not a BOS.
+
+One BOS per level (locked): an unchanged structural level produces at most one
+BOS. The engine remembers the last swing it emitted a bullish BOS for and the
+last it emitted a bearish BOS for; a later close beyond that SAME swing emits
+nothing. A different active swing (a newly confirmed structural swing) is a new
+level and may produce its own BOS. The BOS rule is independent of CHOCH: there
+is no opposite-wick exclusion, and this engine never looks at the protected
+swing.
 
 Ordering: within one candle, swings are confirmed and StructureEngine is
 updated FIRST; the snapshot passed here must be that updated snapshot.
-
-"CHOCH only" rule (Option A): if the same candle's range also goes strictly
-beyond the PROTECTED swing (its low below the active low in BULLISH, its high
-above the active high in BEARISH), no BOS is emitted, because a CHOCH is
-recorded for that candle instead. This engine only compares prices for that
-purpose; it creates no CHOCH and never changes any state.
 
 NOT here: CHOCH detection, StructureEngine changes, pivots, zones, liquidity,
 entries, risk, TP/SL or execution.
@@ -32,11 +33,12 @@ would be lookahead). A rejected call changes nothing.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from koffie.strategy.models.bos import BOS, BOSDirection
 from koffie.strategy.models.candle import Candle, Timeframe
 from koffie.strategy.models.structure import StructureSnapshot, StructureState
+from koffie.strategy.models.swing import Swing
 
 
 class BOSEngine:
@@ -46,6 +48,8 @@ class BOSEngine:
         self._timeframe = timeframe
         self._history: List[BOS] = []
         self._last_candle: Optional[Candle] = None
+        # Last swing a BOS was emitted for, per direction (one BOS per level).
+        self._last_broken: Dict[BOSDirection, Swing] = {}
 
     @property
     def timeframe(self) -> Timeframe:
@@ -68,11 +72,14 @@ class BOSEngine:
         """
         self._validate(candle, now, snapshot)
         bos = self._detect(candle, snapshot)
+        if bos is not None and self._last_broken.get(bos.direction) == bos.broken_swing:
+            bos = None                                        # same unchanged level
 
         # Commit only after validation and construction succeeded.
         self._last_candle = candle
         if bos is not None:
             self._history.append(bos)
+            self._last_broken[bos.direction] = bos.broken_swing
         return bos
 
     def _validate(self, candle: Candle, now: datetime, snapshot: StructureSnapshot) -> None:
@@ -110,22 +117,17 @@ class BOSEngine:
 
     @staticmethod
     def _detect(candle: Candle, snapshot: StructureSnapshot) -> Optional[BOS]:
+        """Pure close-based test against the active structural level."""
         state = snapshot.state
         if state is StructureState.BULLISH:
             level = snapshot.active_swing_high
-            protected = snapshot.protected_swing              # active low
             if not candle.close > level.price:
-                return None
-            if candle.low < protected.price:                  # CHOCH candle: CHOCH only
                 return None
             return BOS(candle.timeframe, BOSDirection.BULLISH, level,
                        candle.open_time, candle.close)
         if state is StructureState.BEARISH:
             level = snapshot.active_swing_low
-            protected = snapshot.protected_swing              # active high
             if not candle.close < level.price:
-                return None
-            if candle.high > protected.price:                 # CHOCH candle: CHOCH only
                 return None
             return BOS(candle.timeframe, BOSDirection.BEARISH, level,
                        candle.open_time, candle.close)

@@ -21,9 +21,8 @@ REVALUATING until later confirmed swings form a directional pair, which
 StructureEngine decides on its own.
 
 BOS and CHOCH are separate events and are returned separately, never merged.
-The "CHOCH wins over BOS" rule (Option A) stays inside BOSEngine: BOS receives
-the same snapshot CHOCH saw, so a candle that qualifies for both yields the
-CHOCH and no BOS. This class does not decide it.
+Each engine applies its own close-based rule to the same snapshot; there is no
+precedence rule between them.
 
 Only closed candles are accepted (each engine enforces it), so the transition is
 made only after the breaking candle has closed, and `at` is its close time.
@@ -56,7 +55,7 @@ class CandleResult:
     swings                newly confirmed swings (zero, one or two)
     structure_transitions state changes made by those swings (directional pairs)
     choch                 the CHOCH event, or None
-    bos                   the BOS event, or None (never set together with choch)
+    bos                   the BOS event, or None (independent of choch)
     revaluating           the CHOCH transition into REVALUATING, or None
     snapshot              the structure after everything above
     """

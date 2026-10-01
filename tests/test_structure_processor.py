@@ -33,14 +33,15 @@ class Feeder:
         self.p = StructureProcessor(tf)
         self.tf, self.i = tf, 0
 
-    def candle(self, high, low):
+    def candle(self, high, low, close=None):
         mid = (high + low) / 2
-        c = Candle(self.tf, T0 + self.i * self.tf.duration, mid, float(high), float(low), mid)
+        close = mid if close is None else close
+        c = Candle(self.tf, T0 + self.i * self.tf.duration, mid, float(high), float(low), close)
         self.i += 1
         return c
 
-    def feed(self, high, low):
-        c = self.candle(high, low)
+    def feed(self, high, low, close=None):
+        c = self.candle(high, low, close)
         return c, self.p.process_candle(c, c.close_time)
 
 
@@ -109,10 +110,10 @@ def test_candle_result_keeps_events_separate_and_is_immutable():
 def test_bearish_choch_from_bullish_enters_revaluating_at_the_candle_close_time():
     f = bullish()
     protected = f.p.structure.protected_swing
-    c, r = f.feed(9, 5)                                    # low 5 < protected low 6
+    c, r = f.feed(9, 5, close=5.5)                         # close 5.5 < protected low 6
     assert isinstance(r.choch, CHOCH) and r.choch.direction is BEAR
     assert r.choch.protected_swing is protected and r.choch.candle_time == c.open_time
-    assert r.choch.break_price == 5 and r.choch.confirmed_at == c.close_time
+    assert r.choch.break_price == 5.5 and r.choch.confirmed_at == c.close_time   # the CLOSE
     t = r.revaluating
     assert (t.from_state, t.to_state, t.reason) == (S.BULLISH, S.REVALUATING, TransitionReason.CHOCH)
     assert t.at == c.close_time == r.choch.confirmed_at and t.trigger_swing_sequence is None
@@ -125,28 +126,28 @@ def test_bearish_choch_from_bullish_enters_revaluating_at_the_candle_close_time(
 def test_bullish_choch_from_bearish_enters_revaluating_at_the_candle_close_time():
     f = bearish()
     protected = f.p.structure.protected_swing
-    c, r = f.feed(15, 9)                                   # high 15 > protected high 14
+    c, r = f.feed(15, 9, close=14.5)                       # close 14.5 > protected high 14
     assert isinstance(r.choch, CHOCH) and r.choch.direction is BULL
     assert r.choch.protected_swing is protected and r.choch.candle_time == c.open_time
-    assert r.choch.break_price == 15 and r.choch.confirmed_at == c.close_time
+    assert r.choch.break_price == 14.5 and r.choch.confirmed_at == c.close_time
     t = r.revaluating
     assert (t.from_state, t.to_state, t.reason) == (S.BEARISH, S.REVALUATING, TransitionReason.CHOCH)
     assert t.at == c.close_time and f.p.structure.state is S.REVALUATING
     assert r.bos is None
 
 
-def test_wick_break_with_the_close_back_inside_still_enters_revaluating():
+def test_wick_break_with_the_close_back_inside_does_not_enter_revaluating():
     f = bullish()
-    c, r = f.feed(11, 5)                                   # close 8 is above the protected low
-    assert r.choch is not None and r.revaluating.at == c.close_time
+    c, r = f.feed(11, 5)                                   # low 5 < 6, but close 8 is above the protected low
+    assert r.choch is None and r.revaluating is None and f.p.structure.state is S.BULLISH
     f = bearish()
-    c, r = f.feed(15, 9)                                   # close 12 is below the protected high
-    assert r.choch is not None and r.revaluating.at == c.close_time
+    c, r = f.feed(15, 9)                                   # high 15 > 14, but close 12 is below the protected high
+    assert r.choch is None and r.revaluating is None and f.p.structure.state is S.BEARISH
 
 
 def test_the_transition_time_is_the_candle_close_not_the_open_and_not_now():
     f = bullish()
-    c = f.candle(9, 5)
+    c = f.candle(9, 5, close=5.5)
     later = c.close_time + timedelta(hours=3)
     r = f.p.process_candle(c, later)
     assert r.revaluating.at == c.close_time
@@ -158,7 +159,7 @@ def test_every_timeframe_enters_revaluating_at_its_own_close_time():
         f = Feeder(tf)
         for h, l in BULLISH_SETUP:
             f.feed(h, l)
-        c, r = f.feed(9, 5)
+        c, r = f.feed(9, 5, close=5.5)
         assert r.choch.timeframe is tf and r.revaluating.timeframe is tf
         assert r.revaluating.at == c.close_time == c.open_time + tf.duration
 
@@ -175,12 +176,12 @@ def test_candle_without_a_choch_does_not_enter_revaluating():
     assert all(t.reason is not TransitionReason.CHOCH for t in f.p.structure.transitions)
 
 
-def test_touching_the_protected_swing_does_not_enter_revaluating():
+def test_a_close_exactly_on_the_protected_swing_does_not_enter_revaluating():
     f = bullish()
-    _, r = f.feed(9, 6)                                    # low == protected low 6
+    _, r = f.feed(9, 4, close=6)                           # close == protected low 6 (wick below it)
     assert r.choch is None and r.revaluating is None and f.p.structure.state is S.BULLISH
     f = bearish()
-    _, r = f.feed(14, 9)                                   # high == protected high 14
+    _, r = f.feed(16, 9, close=14)                         # close == protected high 14 (wick above it)
     assert r.choch is None and r.revaluating is None and f.p.structure.state is S.BEARISH
 
 
@@ -225,7 +226,7 @@ def test_a_brand_new_processor_produces_no_choch():
 # ---------------------------------------------------------------- 5. REVALUATING
 def test_revaluating_does_not_produce_another_choch():
     f = bullish()
-    _, first = f.feed(9, 5)
+    _, first = f.feed(9, 5, close=5.5)
     assert first.choch is not None and f.p.structure.state is S.REVALUATING
     count = len(f.p.structure.transitions)
     for high, low in ((9, 4), (9, 3), (9, 2)):             # lower lows, no new swings form
@@ -238,18 +239,18 @@ def test_revaluating_does_not_produce_another_choch():
 
 def test_choch_does_not_establish_the_new_trend():
     f = bullish()
-    _, r = f.feed(9, 5)
+    _, r = f.feed(9, 5, close=5.5)
     assert r.snapshot.state is S.REVALUATING               # not BEARISH
     assert f.p.structure.permission.value == "NO_TRADE_PERMITTED"
     assert f.p.structure.protected_swing is None
     f = bearish()
-    _, r = f.feed(15, 9)
+    _, r = f.feed(15, 9, close=14.5)
     assert r.snapshot.state is S.REVALUATING               # not BULLISH
 
 
 def test_the_new_direction_comes_only_from_later_swings():
     f = bullish()
-    f.feed(9, 5)
+    f.feed(9, 5, close=5.5)
     directional = []
     for high, low in ((9, 4), (12, 3), (8, 6), (13, 7), (6, 3), (5, 1)):
         _, r = f.feed(high, low)
@@ -264,7 +265,7 @@ def test_the_new_direction_comes_only_from_later_swings():
 # ---------------------------------------------------------------- 6. only after the candle has closed
 def test_an_unfinished_candle_is_rejected_and_nothing_changes():
     f = bullish()
-    c = f.candle(9, 5)
+    c = f.candle(9, 5, close=5.5)
     before = engine_state(f.p)
     for at in (c.open_time, c.open_time + timedelta(minutes=4, seconds=59)):
         with pytest.raises(ValueError):
@@ -277,14 +278,14 @@ def test_an_unfinished_candle_is_rejected_and_nothing_changes():
 
 def test_the_transition_happens_at_the_first_moment_the_candle_is_closed():
     f = bullish()
-    c = f.candle(9, 5)
+    c = f.candle(9, 5, close=5.5)
     r = f.p.process_candle(c, c.close_time)                # exactly at close_time
     assert r.revaluating is not None and r.revaluating.at == c.close_time
 
 
 def test_rejected_input_changes_nothing_in_any_engine():
     f = bullish()
-    good = f.candle(9, 5)
+    good = f.candle(9, 5, close=5.5)
     before = engine_state(f.p)
     wrong_tf = Candle(M15, good.open_time, 7, 9, 5, 7)
     aware = Candle(M5, datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc), 7, 9, 5, 7)
@@ -311,7 +312,7 @@ def test_enter_revaluating_is_called_once_by_the_caller_with_the_candle_close_ti
     c1, _ = f.feed(14, 11.5)                               # BOS candle, no CHOCH
     c2, _ = f.feed(12, 10)                                 # nothing
     assert calls == []
-    c3, r = f.feed(9, 5)                                   # CHOCH
+    c3, r = f.feed(9, 5, close=5.5)                        # CHOCH
     assert calls == [c3.close_time] and r.revaluating.at == c3.close_time
 
 
@@ -319,7 +320,7 @@ def test_if_the_caller_does_not_call_enter_revaluating_the_structure_never_moves
     f = bullish()
     calls = []
     f.p.structure.enter_revaluating = lambda at: calls.append(at)    # caller step disabled
-    c, r = f.feed(9, 5)
+    c, r = f.feed(9, 5, close=5.5)
     assert r.choch is not None and calls == [c.close_time]
     assert f.p.structure.state is S.BULLISH                # CHOCHEngine itself moved nothing
     assert all(t.reason is not TransitionReason.CHOCH for t in f.p.structure.transitions)
@@ -332,7 +333,7 @@ def test_choch_engine_holds_no_structure_engine_and_the_processor_owns_the_call(
     # A stand-alone CHOCHEngine given a snapshot returns the event and changes nothing.
     standalone = CHOCHEngine(M5)
     snap = f.p.structure.snapshot
-    c = f.candle(9, 5)
+    c = f.candle(9, 5, close=5.5)
     event = standalone.process_candle(c, c.close_time, snap)
     assert event is not None and f.p.structure.snapshot == snap
     assert f.p.structure.state is S.BULLISH and f.p.structure.transitions[-1].reason \
@@ -340,36 +341,38 @@ def test_choch_engine_holds_no_structure_engine_and_the_processor_owns_the_call(
 
 
 # ---------------------------------------------------------------- 8. BOS behaviour unchanged
-def test_bullish_structure_candle_meeting_both_conditions_gives_choch_only():
+def test_bullish_structure_opposite_wick_candle_is_a_bos_and_not_a_choch():
     f = bullish()
-    _, r = f.feed(20, 5)                                   # close 12.5 > 12 (BOS) and low 5 < 6 (CHOCH)
-    assert r.choch is not None and r.bos is None and r.revaluating is not None
-    assert f.p.bos_engine.history == ()                    # Option A is applied inside BOSEngine
+    _, r = f.feed(20, 5)                                   # close 12.5 > 12 (BOS); low 5 < 6 is only a wick
+    assert r.bos is not None and r.bos.direction is BOSDirection.BULLISH
+    assert r.choch is None and r.revaluating is None
+    assert f.p.bos_engine.history == (r.bos,) and f.p.structure.state is S.BULLISH
 
 
-def test_bearish_structure_candle_meeting_both_conditions_gives_choch_only():
+def test_bearish_structure_opposite_wick_candle_is_a_bos_and_not_a_choch():
     f = bearish()
     c0 = f.candle(15, 1)
-    c = Candle(M5, c0.open_time, 10, 15, 1, 5)             # close 5 < active low 8 (BOS), high 15 > 14 (CHOCH)
+    c = Candle(M5, c0.open_time, 10, 15, 1, 5)             # close 5 < active low 8 (BOS); high 15 > 14 is only a wick
     r = f.p.process_candle(c, c.close_time)
-    assert r.choch is not None and r.choch.direction is BULL
-    assert r.bos is None and r.revaluating is not None
-    assert f.p.bos_engine.history == ()
+    assert r.bos is not None and r.bos.direction is BOSDirection.BEARISH
+    assert r.choch is None and r.revaluating is None
+    assert f.p.bos_engine.history == (r.bos,) and f.p.structure.state is S.BEARISH
 
 
-def test_bos_is_unchanged_for_repeated_closes_beyond_the_level():
+def test_bos_is_emitted_once_for_repeated_closes_beyond_the_unchanged_level():
     f = bullish()
     first = f.feed(14, 11.5)[1].bos
     second = f.feed(15, 12.5)[1].bos
-    assert first.direction is second.direction is BOSDirection.BULLISH
-    assert first.broken_swing is second.broken_swing is f.p.structure.snapshot.active_swing_high
-    assert len(f.p.bos_engine.history) == 2
+    assert first.direction is BOSDirection.BULLISH and second is None
+    assert first.broken_swing is f.p.structure.snapshot.active_swing_high   # level unchanged
+    assert len(f.p.bos_engine.history) == 1
     assert f.p.structure.state is S.BULLISH
 
 
 def test_no_bos_after_the_structure_has_entered_revaluating():
     f = bullish()
-    f.feed(9, 5)
+    f.feed(9, 5, close=5.5)
+    assert f.p.structure.state is S.REVALUATING
     _, r = f.feed(9, 4)
     assert r.bos is None and f.p.bos_engine.history == ()
 
@@ -379,6 +382,7 @@ class Reference:
 
     def __init__(self, tf=M5):
         self.swing, self.structure = SwingEngine(tf), StructureEngine(tf)
+        self.used = {}                                     # BOS dedupe memory, never reset
 
     def step(self, c):
         self.structure.process_swings(self.swing.process_candle(c, c.close_time))
@@ -386,22 +390,24 @@ class Reference:
         choch = bos = None
         if snap.state is S.BULLISH:
             hi, lo = snap.active_swing_high, snap.active_swing_low
-            if c.low < lo.price:
-                choch = (BEAR, lo.sequence, c.open_time, c.low)
-            elif c.close > hi.price:
+            if c.close < lo.price:
+                choch = (BEAR, lo.sequence, c.open_time, c.close)
+            if c.close > hi.price and self.used.get(BOSDirection.BULLISH) != hi.sequence:
+                self.used[BOSDirection.BULLISH] = hi.sequence
                 bos = (BOSDirection.BULLISH, hi.sequence, c.open_time)
         elif snap.state is S.BEARISH:
             hi, lo = snap.active_swing_high, snap.active_swing_low
-            if c.high > hi.price:
-                choch = (BULL, hi.sequence, c.open_time, c.high)
-            elif c.close < lo.price:
+            if c.close > hi.price:
+                choch = (BULL, hi.sequence, c.open_time, c.close)
+            if c.close < lo.price and self.used.get(BOSDirection.BEARISH) != lo.sequence:
+                self.used[BOSDirection.BEARISH] = lo.sequence
                 bos = (BOSDirection.BEARISH, lo.sequence, c.open_time)
         if choch is not None:
             self.structure.enter_revaluating(c.close_time)
         return choch, bos
 
 
-def test_random_flow_matches_the_reference_and_existing_bos_behaviour():
+def test_random_flow_matches_the_close_based_reference():
     total_choch = total_bos = 0
     seeds_with_two_choch = 0
     for seed in range(80):
@@ -422,7 +428,6 @@ def test_random_flow_matches_the_reference_and_existing_bos_behaviour():
                 r.bos.direction, r.bos.broken_swing.sequence, r.bos.candle_time)
             assert got_choch == want_choch, (seed, i)
             assert got_bos == want_bos, (seed, i)
-            assert not (r.choch is not None and r.bos is not None), (seed, i)
             assert (r.revaluating is not None) == (r.choch is not None), (seed, i)
             if r.revaluating is not None:
                 assert r.revaluating.at == c.close_time and r.snapshot.state is S.REVALUATING

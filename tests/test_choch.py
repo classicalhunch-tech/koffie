@@ -96,30 +96,34 @@ def test_bullish_break_price_must_be_strictly_above_the_protected_high():
     assert choch(BULL, price=100.0001).break_price == 100.0001
 
 
-# ------------------------------------------------------------- the wick counts
-def test_a_wick_through_the_protected_low_is_enough_even_if_the_close_is_back_inside():
+# ------------------------------------------------------------- the close counts, not the wick
+def test_a_wick_through_the_protected_low_is_not_a_choch_if_the_close_is_back_inside():
     swing = sw(LOW, 100)
     candle = Candle(M5, T0 + timedelta(hours=1), 102, 104, 96, 103)   # low 96 < 100, close 103
-    c = CHOCH(M5, BEAR, swing, candle.open_time, candle.low)
-    assert c.break_price == 96 and candle.close > swing.price
+    with pytest.raises(ValueError):
+        CHOCH(M5, BEAR, swing, candle.open_time, candle.close)        # break_price is the close
+    c = CHOCH(M5, BEAR, swing, candle.open_time, 99)                  # a close beyond the level works
+    assert c.break_price == 99
 
 
-def test_a_wick_through_the_protected_high_is_enough_even_if_the_close_is_back_inside():
+def test_a_wick_through_the_protected_high_is_not_a_choch_if_the_close_is_back_inside():
     swing = sw(HIGH, 100)
     candle = Candle(M5, T0 + timedelta(hours=1), 98, 104, 97, 99)     # high 104 > 100, close 99
-    c = CHOCH(M5, BULL, swing, candle.open_time, candle.high)
-    assert c.break_price == 104 and candle.close < swing.price
+    with pytest.raises(ValueError):
+        CHOCH(M5, BULL, swing, candle.open_time, candle.close)
+    c = CHOCH(M5, BULL, swing, candle.open_time, 101)
+    assert c.break_price == 101
 
 
-def test_a_candle_that_only_touches_the_level_is_not_a_choch():
+def test_a_candle_that_closes_exactly_on_the_level_is_not_a_choch():
     swing_low = sw(LOW, 100)
-    touch_low = Candle(M5, T0 + timedelta(hours=1), 102, 104, 100, 103)   # low == level
+    close_on_low = Candle(M5, T0 + timedelta(hours=1), 102, 104, 96, 100)   # close == level
     with pytest.raises(ValueError):
-        CHOCH(M5, BEAR, swing_low, touch_low.open_time, touch_low.low)
+        CHOCH(M5, BEAR, swing_low, close_on_low.open_time, close_on_low.close)
     swing_high = sw(HIGH, 100)
-    touch_high = Candle(M5, T0 + timedelta(hours=1), 98, 100, 97, 99)     # high == level
+    close_on_high = Candle(M5, T0 + timedelta(hours=1), 98, 104, 97, 100)   # close == level
     with pytest.raises(ValueError):
-        CHOCH(M5, BULL, swing_high, touch_high.open_time, touch_high.high)
+        CHOCH(M5, BULL, swing_high, close_on_high.open_time, close_on_high.close)
 
 
 # ------------------------------------------------------------- timeframe and causality
@@ -208,13 +212,13 @@ def test_choch_is_immutable_hashable_and_value_equal():
 def test_can_be_built_from_real_candles_and_swings_on_every_timeframe():
     for tf in (M5, M15, H1):
         low_swing = sw(LOW, 100, tf=tf)
-        candle = Candle(tf, T0 + 10 * tf.duration, 101, 103, 97, 102)
-        c = CHOCH(tf, BEAR, low_swing, candle.open_time, candle.low)
-        assert c.confirmed_at == candle.close_time and c.break_price == candle.low
+        candle = Candle(tf, T0 + 10 * tf.duration, 101, 103, 97, 98)       # close 98 < 100
+        c = CHOCH(tf, BEAR, low_swing, candle.open_time, candle.close)
+        assert c.confirmed_at == candle.close_time and c.break_price == candle.close
         high_swing = sw(HIGH, 100, tf=tf)
-        candle2 = Candle(tf, T0 + 10 * tf.duration, 99, 103, 98, 99.5)
-        c2 = CHOCH(tf, BULL, high_swing, candle2.open_time, candle2.high)
-        assert c2.break_price == candle2.high
+        candle2 = Candle(tf, T0 + 10 * tf.duration, 99, 103, 98, 102)      # close 102 > 100
+        c2 = CHOCH(tf, BULL, high_swing, candle2.open_time, candle2.close)
+        assert c2.break_price == candle2.close
 
 
 def test_protected_swing_matches_the_structure_snapshot_definition():

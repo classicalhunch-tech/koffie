@@ -3,16 +3,12 @@
 A CHOCH records that the PROTECTED swing of an established trend was broken:
 
     BULLISH structure -> protected swing = active swing LOW
-        broken by a candle trading BELOW it   -> CHOCH toward BEARISH
+        broken by a candle CLOSING BELOW it   -> CHOCH toward BEARISH
     BEARISH structure -> protected swing = active swing HIGH
-        broken by a candle trading ABOVE it   -> CHOCH toward BULLISH
+        broken by a candle CLOSING ABOVE it   -> CHOCH toward BULLISH
 
-Current owner rule: the WHOLE CANDLE counts, so a wick strictly beyond the
-protected swing is sufficient (touching the level exactly is not). NOTE: this
-differs from spec sections 12, 38, 41 and 44, which still describe a
-closing-price CHOCH; the document should be amended to match. The field is
-called `break_price` (the candle price that went beyond the level) so the
-record stays valid if the rule ever changes.
+CHOCH is close-based (locked): a wick beyond the protected swing without a
+close beyond it is not a CHOCH. `break_price` is the breaking candle's close.
 
 A CHOCH is not a trade entry and does not itself declare a new trend. The
 structure moves to REVALUATING when a later component calls
@@ -48,9 +44,8 @@ class CHOCH:
     direction        BEARISH (protected LOW broken) or BULLISH (protected HIGH broken)
     protected_swing  the swing that was broken: LOW for BEARISH, HIGH for BULLISH
     candle_time      open_time of the breaking candle
-    break_price      the breaking candle's price beyond the level: its low for a
-                     BEARISH CHOCH, its high for a BULLISH one; strictly beyond
-                     the protected swing's price
+    break_price      the breaking candle's CLOSE; strictly beyond the protected
+                     swing's price (below it for BEARISH, above it for BULLISH)
 
     `confirmed_at` is derived: the breaking candle's close time. Only closed
     candles are processed, so the break becomes knowable when the candle closes.
@@ -87,12 +82,12 @@ class CHOCH:
             if self.protected_swing.swing_type is not SwingType.LOW:
                 raise ValueError("a bearish CHOCH breaks a protected swing LOW")
             if not self.break_price < self.protected_swing.price:
-                raise ValueError("a bearish CHOCH must trade strictly below the protected low")
+                raise ValueError("a bearish CHOCH must close strictly below the protected low")
         else:
             if self.protected_swing.swing_type is not SwingType.HIGH:
                 raise ValueError("a bullish CHOCH breaks a protected swing HIGH")
             if not self.break_price > self.protected_swing.price:
-                raise ValueError("a bullish CHOCH must trade strictly above the protected high")
+                raise ValueError("a bullish CHOCH must close strictly above the protected high")
 
         if (self.candle_time.tzinfo is None) != (self.protected_swing.confirmed_at.tzinfo is None):
             raise ValueError(

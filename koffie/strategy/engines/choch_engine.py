@@ -3,20 +3,19 @@
 Detects CHOCH (Change of Character) on ONE timeframe from a CLOSED candle and
 the current StructureSnapshot. It only DETECTS and RETURNS the event.
 
-    BULLISH structure: candle.low  strictly below the protected swing LOW  -> bearish CHOCH
-    BEARISH structure: candle.high strictly above the protected swing HIGH -> bullish CHOCH
+    BULLISH structure: candle.close strictly below the protected swing LOW  -> bearish CHOCH
+    BEARISH structure: candle.close strictly above the protected swing HIGH -> bullish CHOCH
     UNDETERMINED / REVALUATING: no protected swing exists, so no CHOCH is emitted.
 
 The protected swing is `snapshot.protected_swing` (the active swing low when
-BULLISH, the active swing high when BEARISH). The rule is wick-based: the
-candle's low or high is compared, not its close. The comparison is strict, so
-a candle that only touches the level is not a CHOCH. The breaking candle is
-the CHOCH candle: `candle_time` is its open time and `break_price` is its low
-(bearish CHOCH) or its high (bullish CHOCH).
+BULLISH, the active swing high when BEARISH). The rule is CLOSE-based (locked):
+only a completed candle's CLOSE beyond the level is a CHOCH. A wick through the
+level whose close stays on the original side is NOT a CHOCH, and a close exactly
+on the level is not beyond it. The breaking candle is the CHOCH candle:
+`candle_time` is its open time and `break_price` is its close. The CHOCH candle
+does not become a swing; swings come only from SwingEngine.
 
-The CHOCH condition never looks at the close, so it is independent of BOS. If
-one candle also satisfies the BOS condition, BOSEngine (Option A) skips the
-BOS; nothing here needs to know about that.
+The CHOCH condition is independent of BOS; each engine applies its own rule.
 
 Caller responsibility (option (a))
 ----------------------------------
@@ -128,14 +127,14 @@ class CHOCHEngine:
         state = snapshot.state
         if state is StructureState.BULLISH:
             protected = snapshot.protected_swing              # active low
-            if not candle.low < protected.price:
+            if not candle.close < protected.price:
                 return None
             return CHOCH(candle.timeframe, CHOCHDirection.BEARISH, protected,
-                         candle.open_time, candle.low)
+                         candle.open_time, candle.close)
         if state is StructureState.BEARISH:
             protected = snapshot.protected_swing              # active high
-            if not candle.high > protected.price:
+            if not candle.close > protected.price:
                 return None
             return CHOCH(candle.timeframe, CHOCHDirection.BULLISH, protected,
-                         candle.open_time, candle.high)
+                         candle.open_time, candle.close)
         return None                                           # UNDETERMINED / REVALUATING
