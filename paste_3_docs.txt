@@ -1,0 +1,28 @@
+﻿===== .pytest_cache\.gitignore =====
+# Created by pytest automatically.
+*
+
+===== .pytest_cache\README.md =====
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+===== .gitignore =====
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+Thumbs.db
+

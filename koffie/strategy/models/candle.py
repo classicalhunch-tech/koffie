@@ -9,11 +9,11 @@ BRR classification (locked)
     BRR = abs(close - open) / (high - low)
 
     high == low                 -> ZERO_RANGE_ANOMALY (never decisive)
-    BRR >  0.70, close > open   -> BULLISH_DECISIVE
-    BRR >  0.70, close < open   -> BEARISH_DECISIVE
-    BRR <= 0.70 (incl. exactly 0.70 and close == open) -> NEUTRAL
+    BRR >  0.50, close > open   -> BULLISH_DECISIVE
+    BRR >  0.50, close < open   -> BEARISH_DECISIVE
+    BRR <= 0.50 (incl. exactly 0.50 and close == open) -> NEUTRAL
 
-The 0.70 default may be overridden via `classify(now, threshold=...)` for
+The 0.50 default may be overridden via `classify(now, threshold=...)` for
 backtesting; the comparison stays strict. BRR alone decides; no ATR, size, wick, displacement or volatility filter.
 Only a fully CLOSED candle can be classified: `classify(now)` raises
 ValueError while `now < close_time`, so a forming candle can never be decisive.
@@ -32,13 +32,13 @@ from enum import Enum
 from typing import Optional
 
 
-BRR_DECISIVE_THRESHOLD = 0.70
+BRR_DECISIVE_THRESHOLD = 0.50
 
 
 class CandleClass(Enum):
     BULLISH_DECISIVE = "BULLISH_DECISIVE"
     BEARISH_DECISIVE = "BEARISH_DECISIVE"
-    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.70
+    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.50
     ZERO_RANGE_ANOMALY = "ZERO_RANGE_ANOMALY"  # high == low
 
     @property
@@ -121,7 +121,7 @@ class Candle:
     @property
     def is_doji(self) -> bool:
         """Literal close == open ONLY. This is NOT the Strategy 1 "DOJI / NEUTRAL"
-        (BRR <= 0.70); use `classify(now)` for that."""
+        (BRR <= 0.50); use `classify(now)` for that."""
         return self.close == self.open
 
     # -- BRR classification (locked Strategy 1 rule) ----------------------
@@ -140,7 +140,7 @@ class Candle:
         Raises ValueError if the candle is not closed at `now` (TypeError if
         `now` is not a datetime), so an unclosed candle is never decisive.
 
-        `threshold` defaults to the locked Strategy 1 value (0.70); it is
+        `threshold` defaults to the locked Strategy 1 value (0.50); it is
         configurable only for future backtesting. The comparison is always
         strict: BRR > threshold is decisive, BRR <= threshold is NEUTRAL.
         It must be a finite number in [0, 1].

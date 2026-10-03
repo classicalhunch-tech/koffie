@@ -16,7 +16,7 @@ def mk(o, h, l, c):
 
 
 def test_threshold_locked():
-    assert BRR_DECISIVE_THRESHOLD == 0.70
+    assert BRR_DECISIVE_THRESHOLD == 0.50
 
 
 def test_brr_above_threshold_is_decisive():
@@ -26,14 +26,13 @@ def test_brr_above_threshold_is_decisive():
 
 
 def test_brr_below_threshold_is_neutral():
-    c = mk(100, 110, 100, 106)            # BRR 0.6
+    c = mk(100, 110, 100, 104)            # BRR 0.4
     assert c.classify(NOW) is CandleClass.NEUTRAL
     assert not c.classify(NOW).is_decisive
 
 
 def test_brr_exactly_threshold_is_neutral():
-    c = mk(100, 110, 100, 107)            # 7/10 == 0.70 exactly
-    assert c.brr == 0.70
+    c = mk(100, 110, 100, 105)            # 5/10 == 0.50 exactly`r`n    assert c.brr == 0.50
     assert c.classify(NOW) is CandleClass.NEUTRAL
 
 
@@ -52,7 +51,7 @@ def test_close_equals_open_is_neutral():
 
 
 def test_doji_with_wide_body_but_not_close_equals_open_is_neutral():
-    # close != open, so is_doji is False, yet Strategy 1 treats BRR <= 0.70 as NEUTRAL.
+    # close != open, so is_doji is False, yet Strategy 1 treats BRR <= 0.50 as NEUTRAL.
     c = mk(100, 110, 100, 105)
     assert not c.is_doji
     assert c.classify(NOW) is CandleClass.NEUTRAL
@@ -82,14 +81,14 @@ def test_now_must_be_datetime():
 
 def test_classification_uses_only_brr_not_size_or_wicks():
     small = mk(100.00, 100.10, 100.00, 100.09)    # tiny candle, BRR 0.9
-    huge = mk(100, 500, 0, 350)                   # huge candle, BRR 0.7 -> neutral
+    huge = mk(100, 500, 0, 250)                   # huge candle, BRR 0.5 -> neutral
     assert small.classify(NOW) is CandleClass.BULLISH_DECISIVE
     assert huge.classify(NOW) is CandleClass.NEUTRAL
 
 
 # ---- configurable threshold keeps the strict ">" comparison -----------------
 def test_default_threshold_is_the_locked_value():
-    c = mk(100, 110, 100, 107)            # BRR exactly 0.70
+    c = mk(100, 110, 100, 105)            # BRR exactly 0.50
     assert c.classify(NOW) is c.classify(NOW, BRR_DECISIVE_THRESHOLD) is CandleClass.NEUTRAL
 
 

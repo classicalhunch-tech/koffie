@@ -1,0 +1,119 @@
+﻿===== TREE (bytes, path) =====
+     124  .gitignore
+       0  koffie\__init__.py
+       0  koffie\strategy\__init__.py
+    6404  koffie\strategy\engines\bos_engine.py
+    6748  koffie\strategy\engines\choch_engine.py
+   10906  koffie\strategy\engines\confirmation_engine.py
+    6524  koffie\strategy\engines\liquidity_engine.py
+    8148  koffie\strategy\engines\pivot_engine.py
+   18579  koffie\strategy\engines\setup_engine.py
+    9304  koffie\strategy\engines\structure_engine.py
+    5574  koffie\strategy\engines\structure_processor.py
+    8056  koffie\strategy\engines\sweep_engine.py
+    6827  koffie\strategy\engines\swing_engine.py
+    5806  koffie\strategy\engines\zone_engine.py
+       0  koffie\strategy\engines\__init__.py
+    4071  koffie\strategy\models\bos.py
+    6231  koffie\strategy\models\candle.py
+    5095  koffie\strategy\models\choch.py
+    8592  koffie\strategy\models\confirmation.py
+    5565  koffie\strategy\models\liquidity.py
+    6693  koffie\strategy\models\pivot.py
+    8012  koffie\strategy\models\setup.py
+   11074  koffie\strategy\models\structure.py
+    6097  koffie\strategy\models\sweep.py
+    3363  koffie\strategy\models\swing.py
+    4246  koffie\strategy\models\zone.py
+       0  koffie\strategy\models\__init__.py
+    8528  tests\test_bos.py
+    7243  tests\test_bos_close_based.py
+   20977  tests\test_bos_engine.py
+    3212  tests\test_candle.py
+    4294  tests\test_candle_classification.py
+   10507  tests\test_choch.py
+    5462  tests\test_choch_close_based.py
+   25791  tests\test_choch_engine.py
+   16675  tests\test_confirmation.py
+   42350  tests\test_confirmation_engine.py
+   11475  tests\test_liquidity.py
+   26041  tests\test_liquidity_engine.py
+    8128  tests\test_pivot.py
+   35670  tests\test_pivot_engine.py
+   13360  tests\test_setup.py
+   67071  tests\test_setup_engine.py
+   18144  tests\test_structure.py
+   24643  tests\test_structure_engine.py
+   21094  tests\test_structure_processor.py
+   13424  tests\test_sweep.py
+   51210  tests\test_sweep_engine.py
+    7016  tests\test_swing.py
+   17610  tests\test_swing_engine.py
+   12347  tests\test_zone.py
+   18614  tests\test_zone_engine.py
+    1736  tests\_structure_fixtures.py
+       0  tests\__init__.py
+===== GIT LOG =====
+ebecc6a Correct Strategy 1 foundation: close-based CHOCH/BOS, BOS dedupe, BRR classification
+f53101e Add StructureProcessor: CHOCH to enter_revaluating caller integration
+2748e5d Add CHOCH engine and tests
+bba9b76 Add market structure: Candle, Swing, Structure, CHOCH, BOS
+3c29b60 Initialize Koffie project
+===== GIT STATUS =====
+A  koffie/strategy/engines/confirmation_engine.py
+A  koffie/strategy/engines/liquidity_engine.py
+A  koffie/strategy/engines/pivot_engine.py
+A  koffie/strategy/engines/setup_engine.py
+A  koffie/strategy/engines/sweep_engine.py
+A  koffie/strategy/engines/zone_engine.py
+A  koffie/strategy/models/confirmation.py
+A  koffie/strategy/models/liquidity.py
+A  koffie/strategy/models/pivot.py
+A  koffie/strategy/models/setup.py
+A  koffie/strategy/models/sweep.py
+A  koffie/strategy/models/zone.py
+A  tests/test_confirmation.py
+A  tests/test_confirmation_engine.py
+A  tests/test_liquidity.py
+A  tests/test_liquidity_engine.py
+A  tests/test_pivot.py
+A  tests/test_pivot_engine.py
+A  tests/test_setup.py
+A  tests/test_setup_engine.py
+A  tests/test_sweep.py
+A  tests/test_sweep_engine.py
+A  tests/test_zone.py
+A  tests/test_zone_engine.py
+?? paste_sources.txt
+===== PYTEST =====
+........................................................................ [ 83%]
+........................................................................ [ 90%]
+........................................................................ [ 96%]
+.....................................                                    [100%]
+1117 passed in 8.68s
+===== TESTS PER FILE =====
+  24  tests/test_bos.py
+  14  tests/test_bos_close_based.py
+  39  tests/test_bos_engine.py
+  12  tests/test_candle.py
+  23  tests/test_candle_classification.py
+  26  tests/test_choch.py
+  11  tests/test_choch_close_based.py
+  46  tests/test_choch_engine.py
+  37  tests/test_confirmation.py
+ 184  tests/test_confirmation_engine.py
+  27  tests/test_liquidity.py
+  46  tests/test_liquidity_engine.py
+  19  tests/test_pivot.py
+  63  tests/test_pivot_engine.py
+  27  tests/test_setup.py
+  78  tests/test_setup_engine.py
+  48  tests/test_structure.py
+  52  tests/test_structure_engine.py
+  30  tests/test_structure_processor.py
+  27  tests/test_sweep.py
+ 154  tests/test_sweep_engine.py
+  21  tests/test_swing.py
+  43  tests/test_swing_engine.py
+  30  tests/test_zone.py
+  36  tests/test_zone_engine.py

@@ -1,0 +1,60 @@
+[1mdiff --git a/koffie/strategy/models/candle.py b/koffie/strategy/models/candle.py[m
+[1mindex 6513593..8d08090 100644[m
+[1m--- a/koffie/strategy/models/candle.py[m
+[1m+++ b/koffie/strategy/models/candle.py[m
+[36m@@ -9,11 +9,11 @@[m [mBRR classification (locked)[m
+     BRR = abs(close - open) / (high - low)[m
+ [m
+     high == low                 -> ZERO_RANGE_ANOMALY (never decisive)[m
+[31m-    BRR >  0.70, close > open   -> BULLISH_DECISIVE[m
+[31m-    BRR >  0.70, close < open   -> BEARISH_DECISIVE[m
+[31m-    BRR <= 0.70 (incl. exactly 0.70 and close == open) -> NEUTRAL[m
+[32m+[m[32m    BRR >  0.50, close > open   -> BULLISH_DECISIVE[m
+[32m+[m[32m    BRR >  0.50, close < open   -> BEARISH_DECISIVE[m
+[32m+[m[32m    BRR <= 0.50 (incl. exactly 0.50 and close == open) -> NEUTRAL[m
+ [m
+[31m-The 0.70 default may be overridden via `classify(now, threshold=...)` for[m
+[32m+[m[32mThe 0.50 default may be overridden via `classify(now, threshold=...)` for[m
+ backtesting; the comparison stays strict. BRR alone decides; no ATR, size, wick, displacement or volatility filter.[m
+ Only a fully CLOSED candle can be classified: `classify(now)` raises[m
+ ValueError while `now < close_time`, so a forming candle can never be decisive.[m
+[36m@@ -32,13 +32,13 @@[m [mfrom enum import Enum[m
+ from typing import Optional[m
+ [m
+ [m
+[31m-BRR_DECISIVE_THRESHOLD = 0.70[m
+[32m+[m[32mBRR_DECISIVE_THRESHOLD = 0.50[m
+ [m
+ [m
+ class CandleClass(Enum):[m
+     BULLISH_DECISIVE = "BULLISH_DECISIVE"[m
+     BEARISH_DECISIVE = "BEARISH_DECISIVE"[m
+[31m-    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.70[m
+[32m+[m[32m    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.50[m
+     ZERO_RANGE_ANOMALY = "ZERO_RANGE_ANOMALY"  # high == low[m
+ [m
+     @property[m
+[36m@@ -121,7 +121,7 @@[m [mclass Candle:[m
+     @property[m
+     def is_doji(self) -> bool:[m
+         """Literal close == open ONLY. This is NOT the Strategy 1 "DOJI / NEUTRAL"[m
+[31m-        (BRR <= 0.70); use `classify(now)` for that."""[m
+[32m+[m[32m        (BRR <= 0.50); use `classify(now)` for that."""[m
+         return self.close == self.open[m
+ [m
+     # -- BRR classification (locked Strategy 1 rule) ----------------------[m
+[36m@@ -140,7 +140,7 @@[m [mclass Candle:[m
+         Raises ValueError if the candle is not closed at `now` (TypeError if[m
+         `now` is not a datetime), so an unclosed candle is never decisive.[m
+ [m
+[31m-        `threshold` defaults to the locked Strategy 1 value (0.70); it is[m
+[32m+[m[32m        `threshold` defaults to the locked Strategy 1 value (0.50); it is[m
+         configurable only for future backtesting. The comparison is always[m
+         strict: BRR > threshold is decisive, BRR <= threshold is NEUTRAL.[m
+         It must be a finite number in [0, 1].[m
+[36m@@ -161,3 +161,5 @@[m [mclass Candle:[m
+                 return CandleClass.BULLISH_DECISIVE[m
+             return CandleClass.BEARISH_DECISIVE   # close < open (close == open gives BRR 0)[m
+         return CandleClass.NEUTRAL[m
+[41m+[m
+[41m+[m
