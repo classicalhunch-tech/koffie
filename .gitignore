@@ -10,3 +10,23 @@ __pycache__/
 *.log
 .DS_Store
 Thumbs.db
+
+# local files, not source
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+backtest_results/
+paste_*.txt
+*.backup
+
+# local files, not source
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/
+backtest_results/
+paste_*.txt
+*.backup

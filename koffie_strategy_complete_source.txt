@@ -1,0 +1,4487 @@
+"""Strategy1: the coordinator that composes the existing Koffie Strategy 1 engines.
+ 
+It contains NO trading rule of its own. Every rule stays in the engine that owns it.
+It only routes completed candles to the right engines, in a causal order, and decides
+whether a confirmed Setup may become a trade.
+ 
+    H1  candle -> StructureProcessor(H1)    -> directional permission
+    M15 candle -> StructureProcessor(M15)   -> BOS
+                -> PivotEngine(M15)         -> PivotOutcome
+                -> ZoneEngine(M15)          -> Zone (the Supply/Demand zone)
+    M5  candle -> SwingEngine(M5)           -> swings
+                -> LiquidityEngine(M5)      -> required liquidity (only READ downstream)
+                -> SetupEngine              -> touch -> Sweep -> Confirmation -> Setup
+                   (its own private SweepEngine / ConfirmationEngine do the sweep and
+                    the post-sweep confirmation)
+                -> EntryEngine              -> Entry (price = close of the confirming candle)
+                -> SLTPEngine               -> SL (sweep candle low/high) and TP (exactly 2R)
+ 
+Directional permission (H1 only)
+--------------------------------
+LONG_ONLY permits DEMAND zones (BUY), SHORT_ONLY permits SUPPLY zones (SELL),
+NO_TRADE_PERMITTED permits nothing. M15 and M5 never override it. The permission is
+read at the moment a Setup is confirmed, and only a Setup confirmed on THIS candle can
+become a trade. A Setup confirmed while the permission did not allow it is reported as
+skipped and is never traded later, so a later permission change cannot create a stale
+entry. The engines keep running regardless of permission; permission only decides
+whether a confirmed Setup is acted on.
+ 
+Causality (no lookahead)
+------------------------
+Candles must be supplied merged in time order, by (close time, timeframe), and when
+several close at the same instant the order is H1, then M15, then M5 (a candle may use
+everything that had already closed when it closed, never anything later). A candle that
+goes backwards in that order, overlaps the previous candle of its timeframe, or is not
+closed at `now` is rejected BEFORE any engine is touched, so a rejected call changes
+nothing. An M5 candle is only evaluated against zones that already existed when it
+opened (`zone.created_at <= candle.open_time`); required liquidity is selected as of
+the candle's open time by the SweepEngine, so a level confirmed by a candle can never be
+swept by that same candle.
+ 
+Trade creation
+--------------
+The SL/TP geometry is checked on the immutable Entry/SLTP value objects BEFORE the
+EntryEngine is asked to create the Entry, because creating an Entry consumes its zone.
+If the geometry is invalid (BUY stop not below entry, SELL stop not above entry) no
+Entry is created, the zone is not consumed and the Setup is reported as skipped. When
+several zones are confirmed by the same candle they are tried in the existing
+`tie_break_order`; zone consumption and the one-trade-per-causal-event rule are
+enforced by SetupEngine.can_create_trade, not here.
+ 
+Not in this module: H4, spread, order flow, volume, risk, position sizing, news,
+execution, flip zones, Strategy 2, or any rule that an engine does not already own.
+Call `process_candle(candle, now)` with `now = candle.close_time` when replaying history.
+"""
+from __future__ import annotations
+ 
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.engines.entry_engine import EntryEngine
+from koffie.strategy.engines.liquidity_engine import LiquidityEngine
+from koffie.strategy.engines.pivot_engine import PivotEngine
+from koffie.strategy.engines.setup_engine import SetupEngine
+from koffie.strategy.engines.sl_tp_engine import SLTPEngine
+from koffie.strategy.engines.structure_processor import StructureProcessor
+from koffie.strategy.engines.swing_engine import SwingEngine
+from koffie.strategy.engines.zone_engine import ZoneEngine
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.entry import Entry, EntryDirection
+from koffie.strategy.models.setup import Setup, SetupStatus, tie_break_order
+from koffie.strategy.models.sl_tp import SLTP
+from koffie.strategy.models.structure import DirectionalPermission
+from koffie.strategy.models.zone import Zone, ZoneType
+ 
+# The H1 permission that allows each zone type (DEMAND = BUY, SUPPLY = SELL).
+PERMISSION_FOR_ZONE_TYPE = {
+    ZoneType.DEMAND: DirectionalPermission.LONG_ONLY,
+    ZoneType.SUPPLY: DirectionalPermission.SHORT_ONLY,
+}
+ 
+# Same-instant feeding order: a candle may use higher-timeframe information that closed at the same time.
+_FEED_RANK = {Timeframe.H1: 0, Timeframe.M15: 1, Timeframe.M5: 2}
+ 
+ 
+def permission_allows(permission: DirectionalPermission, zone_type: ZoneType) -> bool:
+    """True when the H1 directional permission allows trading a zone of this type."""
+    if not isinstance(permission, DirectionalPermission):
+        raise TypeError("permission must be a DirectionalPermission")
+    if not isinstance(zone_type, ZoneType):
+        raise TypeError("zone_type must be a ZoneType")
+    return PERMISSION_FOR_ZONE_TYPE[zone_type] is permission
+ 
+ 
+class SkipReason(Enum):
+    DIRECTION_NOT_PERMITTED = "DIRECTION_NOT_PERMITTED"   # H1 permission did not allow this zone type
+    NOT_TRADEABLE = "NOT_TRADEABLE"                        # zone already consumed, or this causal event already traded
+    INVALID_GEOMETRY = "INVALID_GEOMETRY"                  # SL on the wrong side of the entry; no entry created
+ 
+ 
+@dataclass(frozen=True)
+class SkippedSetup:
+    """A Setup confirmed on this candle that did NOT become a trade, and why."""
+ 
+    setup: Setup
+    reason: SkipReason
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.setup, Setup):
+            raise ValueError("setup must be a Setup")
+        if not isinstance(self.reason, SkipReason):
+            raise ValueError("reason must be a SkipReason")
+ 
+ 
+@dataclass(frozen=True)
+class Strategy1Trade:
+    """The final Strategy 1 trade result: one Entry and its SL/TP."""
+ 
+    entry: Entry
+    sl_tp: SLTP
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.entry, Entry):
+            raise ValueError("entry must be an Entry")
+        if not isinstance(self.sl_tp, SLTP):
+            raise ValueError("sl_tp must be an SLTP")
+        if self.sl_tp.entry != self.entry:
+            raise ValueError("the SLTP must belong to the Entry")
+ 
+    @property
+    def setup(self) -> Setup:
+        return self.entry.setup
+ 
+    @property
+    def zone(self) -> Zone:
+        return self.entry.zone
+ 
+    @property
+    def direction(self) -> EntryDirection:
+        return self.entry.direction
+ 
+    @property
+    def entry_price(self) -> float:
+        return self.entry.price
+ 
+    @property
+    def stop_loss(self) -> float:
+        return self.sl_tp.stop_loss
+ 
+    @property
+    def take_profit(self) -> float:
+        return self.sl_tp.take_profit
+ 
+    @property
+    def known_at(self) -> datetime:
+        return self.entry.known_at
+ 
+ 
+@dataclass(frozen=True)
+class Strategy1Result:
+    """What ONE candle produced. Fields that do not apply to the candle's timeframe are empty.
+ 
+    candle         the candle that was processed
+    permission     the H1 directional permission after this candle
+    new_zones      M15 zones created by this candle (M15 candles only)
+    setup_changes  Setups this M5 candle started or whose status it changed
+    trades         trades created by this M5 candle
+    skipped        Setups confirmed by this M5 candle that did not become a trade
+    """
+ 
+    candle: Candle
+    permission: DirectionalPermission
+    new_zones: Tuple[Zone, ...] = ()
+    setup_changes: Tuple[Setup, ...] = ()
+    trades: Tuple[Strategy1Trade, ...] = ()
+    skipped: Tuple[SkippedSetup, ...] = ()
+ 
+ 
+class Strategy1:
+    def __init__(self) -> None:
+        self._h1 = StructureProcessor(Timeframe.H1)
+        self._m15 = StructureProcessor(Timeframe.M15)
+        self._pivots = PivotEngine(Timeframe.M15)
+        self._zones = ZoneEngine(Timeframe.M15)
+        self._m5_swings = SwingEngine(Timeframe.M5)
+        self._liquidity = LiquidityEngine(Timeframe.M5)
+        self._setups = SetupEngine(self._liquidity)
+        self._entries = EntryEngine(self._setups)
+        self._sl_tps = SLTPEngine(self._entries)
+        self._trades: List[Strategy1Trade] = []
+        self._last_key: Optional[Tuple[datetime, int]] = None
+        self._last_candle: Dict[Timeframe, Candle] = {}
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def permission(self) -> DirectionalPermission:
+        """The H1 directional permission right now."""
+        return self._h1.structure.permission
+ 
+    @property
+    def zones(self) -> Tuple[Zone, ...]:
+        """Every M15 Supply/Demand zone created so far, oldest first."""
+        return self._zones.zones
+ 
+    @property
+    def trades(self) -> Tuple[Strategy1Trade, ...]:
+        """Every trade created, in creation order. Never removed."""
+        return tuple(self._trades)
+ 
+    @property
+    def h1(self) -> StructureProcessor:
+        return self._h1
+ 
+    @property
+    def m15(self) -> StructureProcessor:
+        return self._m15
+ 
+    @property
+    def zone_engine(self) -> ZoneEngine:
+        return self._zones
+ 
+    @property
+    def liquidity_engine(self) -> LiquidityEngine:
+        return self._liquidity
+ 
+    @property
+    def setup_engine(self) -> SetupEngine:
+        return self._setups
+ 
+    @property
+    def entry_engine(self) -> EntryEngine:
+        return self._entries
+ 
+    @property
+    def sl_tp_engine(self) -> SLTPEngine:
+        return self._sl_tps
+ 
+    # --------------------------------------------------------------------- input
+    def process_candle(self, candle: Candle, now: datetime) -> Strategy1Result:
+        """Run ONE completed candle (H1, M15 or M5) through the Strategy 1 chain.
+ 
+        Raises TypeError for wrong argument types (or mixed naive/aware datetimes) and
+        ValueError for an unsupported timeframe, a candle not closed at `now`, a candle
+        out of (close time, timeframe) order, or one that overlaps the previous candle of
+        its timeframe. These checks run before any engine is touched, so a rejected call
+        changes nothing.
+        """
+        self._validate(candle, now)
+        if candle.timeframe is Timeframe.H1:
+            result = self._on_h1(candle, now)
+        elif candle.timeframe is Timeframe.M15:
+            result = self._on_m15(candle, now)
+        else:
+            result = self._on_m5(candle, now)
+        self._last_key = (candle.close_time, _FEED_RANK[candle.timeframe])
+        self._last_candle[candle.timeframe] = candle
+        return result
+ 
+    def _validate(self, candle: Candle, now: datetime) -> None:
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if candle.timeframe not in _FEED_RANK:
+            raise ValueError(f"Strategy 1 does not use {candle.timeframe.value} candles")
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only completed candles may be processed")
+        key = (candle.close_time, _FEED_RANK[candle.timeframe])
+        if self._last_key is not None and key < self._last_key:
+            raise ValueError(
+                "candles must be supplied in (close time, timeframe) order: "
+                "H1 before M15 before M5 when they close at the same instant"
+            )
+        previous = self._last_candle.get(candle.timeframe)
+        if previous is not None and candle.open_time < previous.close_time:
+            raise ValueError(
+                f"{candle.timeframe.value} candles must not overlap or repeat "
+                "(candle opens before the previous candle closed)"
+            )
+ 
+    # ------------------------------------------------------------------ per timeframe
+    def _on_h1(self, candle: Candle, now: datetime) -> Strategy1Result:
+        self._h1.process_candle(candle, now)
+        return Strategy1Result(candle=candle, permission=self.permission)
+ 
+    def _on_m15(self, candle: Candle, now: datetime) -> Strategy1Result:
+        processed = self._m15.process_candle(candle, now)
+        outcome = self._pivots.process_candle(candle, now, processed.bos)
+        new_zones: Tuple[Zone, ...] = ()
+        if outcome is not None:
+            zone = self._zones.process_outcome(outcome, now)
+            if zone is not None:
+                new_zones = (zone,)
+        return Strategy1Result(candle=candle, permission=self.permission, new_zones=new_zones)
+ 
+    def _on_m5(self, candle: Candle, now: datetime) -> Strategy1Result:
+        # 1. liquidity: swings confirmed by this candle become known at its close, so the
+        #    SweepEngine (which selects liquidity as of the candle OPEN) cannot use them yet.
+        for swing in self._m5_swings.process_candle(candle, now):
+            self._liquidity.process_swing(swing, now)
+ 
+        # 2. setups: only zones that already existed when the candle opened.
+        changes: List[Setup] = []
+        for zone in self._zones.zones:
+            if candle.open_time < zone.created_at:
+                continue
+            setup = self._setups.process_candle(zone, candle, now)
+            if setup is not None:
+                changes.append(setup)
+ 
+        # 3. only Setups confirmed by THIS candle can become a trade.
+        confirmed_now = [
+            s for s in changes
+            if self._setups.status_for(s) is SetupStatus.CONFIRMED
+            and self._setups.confirmation_for(s).candle == candle
+        ]
+        permission = self.permission
+        trades: List[Strategy1Trade] = []
+        skipped: List[SkippedSetup] = []
+        for setup in tie_break_order(confirmed_now):
+            if not permission_allows(permission, setup.zone_type):
+                skipped.append(SkippedSetup(setup, SkipReason.DIRECTION_NOT_PERMITTED))
+                continue
+            if not self._setups.can_create_trade(setup):
+                skipped.append(SkippedSetup(setup, SkipReason.NOT_TRADEABLE))
+                continue
+            candidate = Entry(setup, self._setups.confirmation_for(setup))
+            try:
+                SLTP(candidate)                       # pure geometry check; creating the Entry would consume the zone
+            except ValueError:
+                skipped.append(SkippedSetup(setup, SkipReason.INVALID_GEOMETRY))
+                continue
+            entry = self._entries.create_entry(setup, now)
+            trade = Strategy1Trade(entry, self._sl_tps.create_sl_tp(entry, now))
+            self._trades.append(trade)
+            trades.append(trade)
+ 
+        return Strategy1Result(
+            candle=candle,
+            permission=permission,
+            setup_changes=tuple(changes),
+            trades=tuple(trades),
+            skipped=tuple(skipped),
+        )
+"""BOSEngine for Koffie Strategy 1 (spec section 11).
+
+Detects BOS (Break of Structure = continuation) on ONE timeframe from a CLOSED
+candle and the current StructureSnapshot.
+
+    BULLISH structure: candle.close strictly above the active swing HIGH -> bullish BOS
+    BEARISH structure: candle.close strictly below the active swing LOW  -> bearish BOS
+    UNDETERMINED / REVALUATING: no BOS is emitted (spec defines BOS only for
+    bullish and bearish markets).
+
+Only the CLOSE counts; a wick beyond the level is not a BOS.
+
+One BOS per level (locked): an unchanged structural level produces at most one
+BOS. The engine remembers the last swing it emitted a bullish BOS for and the
+last it emitted a bearish BOS for; a later close beyond that SAME swing emits
+nothing. A different active swing (a newly confirmed structural swing) is a new
+level and may produce its own BOS. The BOS rule is independent of CHOCH: there
+is no opposite-wick exclusion, and this engine never looks at the protected
+swing.
+
+Ordering: within one candle, swings are confirmed and StructureEngine is
+updated FIRST; the snapshot passed here must be that updated snapshot.
+
+NOT here: CHOCH detection, StructureEngine changes, pivots, zones, liquidity,
+entries, risk, TP/SL or execution.
+
+Integrity checks (no strategy behaviour): candle is a Candle on this timeframe
+and closed at `now`; it must open at or after the previous candle's close (gaps
+are fine, overlaps and repeats are not); the snapshot is a StructureSnapshot on
+this timeframe and holds no swing confirmed after this candle closed (that
+would be lookahead). A rejected call changes nothing.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from koffie.strategy.models.bos import BOS, BOSDirection
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.structure import StructureSnapshot, StructureState
+from koffie.strategy.models.swing import Swing
+
+
+class BOSEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._history: List[BOS] = []
+        self._last_candle: Optional[Candle] = None
+        # Last swing a BOS was emitted for, per direction (one BOS per level).
+        self._last_broken: Dict[BOSDirection, Swing] = {}
+
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+
+    @property
+    def history(self) -> Tuple[BOS, ...]:
+        """All BOS events in the order they occurred, oldest first."""
+        return tuple(self._history)
+
+    def process_candle(
+        self, candle: Candle, now: datetime, snapshot: StructureSnapshot
+    ) -> Optional[BOS]:
+        """Evaluate one CLOSED candle against the (already updated) structure.
+
+        Returns the BOS event, or None. Raises TypeError for wrong argument
+        types and ValueError for a wrong timeframe, an unfinished, repeated or
+        overlapping candle, or a snapshot containing future swings. Nothing is
+        changed when an exception is raised.
+        """
+        self._validate(candle, now, snapshot)
+        bos = self._detect(candle, snapshot)
+        if bos is not None and self._last_broken.get(bos.direction) == bos.broken_swing:
+            bos = None                                        # same unchanged level
+
+        # Commit only after validation and construction succeeded.
+        self._last_candle = candle
+        if bos is not None:
+            self._history.append(bos)
+            self._last_broken[bos.direction] = bos.broken_swing
+        return bos
+
+    def _validate(self, candle: Candle, now: datetime, snapshot: StructureSnapshot) -> None:
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if not isinstance(snapshot, StructureSnapshot):
+            raise TypeError("snapshot must be a StructureSnapshot")
+        if candle.timeframe is not self._timeframe:
+            raise ValueError(
+                f"BOSEngine is configured for {self._timeframe.value}, "
+                f"but received a {candle.timeframe.value} candle"
+            )
+        if snapshot.timeframe is not self._timeframe:
+            raise ValueError(
+                f"BOSEngine is configured for {self._timeframe.value}, "
+                f"but received a {snapshot.timeframe.value} snapshot"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be processed")
+        if self._last_candle is not None and candle.open_time < self._last_candle.close_time:
+            raise ValueError(
+                "candles must be supplied in chronological order without overlap "
+                "(candle opens before the previous candle closed)"
+            )
+        for swing in (
+            snapshot.active_swing_high, snapshot.prior_swing_high,
+            snapshot.active_swing_low, snapshot.prior_swing_low,
+        ):
+            if swing is not None and swing.confirmed_at > candle.close_time:
+                raise ValueError(
+                    "snapshot contains a swing confirmed after this candle closed (lookahead)"
+                )
+
+    @staticmethod
+    def _detect(candle: Candle, snapshot: StructureSnapshot) -> Optional[BOS]:
+        """Pure close-based test against the active structural level."""
+        state = snapshot.state
+        if state is StructureState.BULLISH:
+            level = snapshot.active_swing_high
+            if not candle.close > level.price:
+                return None
+            return BOS(candle.timeframe, BOSDirection.BULLISH, level,
+                       candle.open_time, candle.close)
+        if state is StructureState.BEARISH:
+            level = snapshot.active_swing_low
+            if not candle.close < level.price:
+                return None
+            return BOS(candle.timeframe, BOSDirection.BEARISH, level,
+                       candle.open_time, candle.close)
+        return None                                           # UNDETERMINED / REVALUATING
+"""CHOCHEngine for Koffie Strategy 1 (spec sections 12-13).
+
+Detects CHOCH (Change of Character) on ONE timeframe from a CLOSED candle and
+the current StructureSnapshot. It only DETECTS and RETURNS the event.
+
+    BULLISH structure: candle.close strictly below the protected swing LOW  -> bearish CHOCH
+    BEARISH structure: candle.close strictly above the protected swing HIGH -> bullish CHOCH
+    UNDETERMINED / REVALUATING: no protected swing exists, so no CHOCH is emitted.
+
+The protected swing is `snapshot.protected_swing` (the active swing low when
+BULLISH, the active swing high when BEARISH). The rule is CLOSE-based (locked):
+only a completed candle's CLOSE beyond the level is a CHOCH. A wick through the
+level whose close stays on the original side is NOT a CHOCH, and a close exactly
+on the level is not beyond it. The breaking candle is the CHOCH candle:
+`candle_time` is its open time and `break_price` is its close. The CHOCH candle
+does not become a swing; swings come only from SwingEngine.
+
+The CHOCH condition is independent of BOS; each engine applies its own rule.
+
+Caller responsibility (option (a))
+----------------------------------
+This engine never changes any state and holds no StructureEngine. After it
+returns a CHOCH, the CALLER moves the structure with
+
+    structure.enter_revaluating(candle.close_time)
+
+A CHOCH does not itself establish a new trend; the new direction comes only
+from later confirmed swings, decided by StructureEngine. The engine keeps no
+memory of the structure between calls: it judges each candle only against the
+snapshot it is given. If the caller does not move the structure to
+REVALUATING, a later candle that again breaks the same protected swing is
+again a CHOCH.
+
+Ordering: within one candle, swings are confirmed and StructureEngine is
+updated FIRST; the snapshot passed here must be that updated snapshot.
+
+NOT here: BOS detection, StructureEngine changes, pivots, zones, liquidity,
+entries, risk, TP/SL or execution.
+
+Integrity checks (no strategy behaviour): candle is a Candle on this timeframe
+and closed at `now`; it must open at or after the previous candle's close (gaps
+are fine, overlaps and repeats are not); the snapshot is a StructureSnapshot on
+this timeframe and holds no swing confirmed after this candle closed (that
+would be lookahead). A rejected call changes nothing.
+"""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.choch import CHOCH, CHOCHDirection
+from koffie.strategy.models.structure import StructureSnapshot, StructureState
+
+
+class CHOCHEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._history: List[CHOCH] = []
+        self._last_candle: Optional[Candle] = None
+
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+
+    @property
+    def history(self) -> Tuple[CHOCH, ...]:
+        """All CHOCH events in the order they occurred, oldest first."""
+        return tuple(self._history)
+
+    def process_candle(
+        self, candle: Candle, now: datetime, snapshot: StructureSnapshot
+    ) -> Optional[CHOCH]:
+        """Evaluate one CLOSED candle against the (already updated) structure.
+
+        Returns the CHOCH event, or None. Raises TypeError for wrong argument
+        types and ValueError for a wrong timeframe, an unfinished, repeated or
+        overlapping candle, or a snapshot containing future swings. Nothing is
+        changed when an exception is raised.
+        """
+        self._validate(candle, now, snapshot)
+        choch = self._detect(candle, snapshot)
+
+        # Commit only after validation and construction succeeded.
+        self._last_candle = candle
+        if choch is not None:
+            self._history.append(choch)
+        return choch
+
+    def _validate(self, candle: Candle, now: datetime, snapshot: StructureSnapshot) -> None:
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if not isinstance(snapshot, StructureSnapshot):
+            raise TypeError("snapshot must be a StructureSnapshot")
+        if candle.timeframe is not self._timeframe:
+            raise ValueError(
+                f"CHOCHEngine is configured for {self._timeframe.value}, "
+                f"but received a {candle.timeframe.value} candle"
+            )
+        if snapshot.timeframe is not self._timeframe:
+            raise ValueError(
+                f"CHOCHEngine is configured for {self._timeframe.value}, "
+                f"but received a {snapshot.timeframe.value} snapshot"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be processed")
+        if self._last_candle is not None and candle.open_time < self._last_candle.close_time:
+            raise ValueError(
+                "candles must be supplied in chronological order without overlap "
+                "(candle opens before the previous candle closed)"
+            )
+        for swing in (
+            snapshot.active_swing_high, snapshot.prior_swing_high,
+            snapshot.active_swing_low, snapshot.prior_swing_low,
+        ):
+            if swing is not None and swing.confirmed_at > candle.close_time:
+                raise ValueError(
+                    "snapshot contains a swing confirmed after this candle closed (lookahead)"
+                )
+
+    @staticmethod
+    def _detect(candle: Candle, snapshot: StructureSnapshot) -> Optional[CHOCH]:
+        state = snapshot.state
+        if state is StructureState.BULLISH:
+            protected = snapshot.protected_swing              # active low
+            if not candle.close < protected.price:
+                return None
+            return CHOCH(candle.timeframe, CHOCHDirection.BEARISH, protected,
+                         candle.open_time, candle.close)
+        if state is StructureState.BEARISH:
+            protected = snapshot.protected_swing              # active high
+            if not candle.close > protected.price:
+                return None
+            return CHOCH(candle.timeframe, CHOCHDirection.BULLISH, protected,
+                         candle.open_time, candle.close)
+        return None                                           # UNDETERMINED / REVALUATING
+"""ConfirmationEngine for Koffie Strategy 1.
+ 
+Runs the locked confirmation sequence for each Sweep on completed 5M candles:
+ 
+    (Sweep, completed 5M candle) -> a Confirmation, an Invalidation, or None
+ 
+The caller supplies the Sweep (this engine does not own or read a SweepEngine) and then
+the Sweep's candles in order. Each Sweep identity has its own independent state:
+ 
+    WAITING_FOR_DECISIVE -> WAITING_FOR_SECOND_DECISIVE -> CONFIRMED | INVALIDATED
+ 
+Transitions (LONG = DEMAND sweep; SHORT = SUPPLY sweep is the mirror image):
+ 
+    BULLISH_DECISIVE (any close)                   -> CONFIRMED          (SHORT: BEARISH_DECISIVE)
+    BEARISH_DECISIVE with close <  zone.low        -> INVALIDATED        (SHORT: BULLISH_DECISIVE, close > zone.high)
+    BEARISH_DECISIVE otherwise, from the 1st state -> WAITING_FOR_SECOND_DECISIVE
+    BEARISH_DECISIVE otherwise, from the 2nd state -> INVALIDATED
+    NEUTRAL or ZERO_RANGE_ANOMALY                  -> no change (they never consume the sequence)
+    anything once CONFIRMED or INVALIDATED         -> no change (terminal)
+ 
+The boundary rule applies to every wrong-direction decisive candle, the first included. A
+wick beyond the boundary never invalidates and a close exactly on it is not beyond it. A
+confirming candle may close outside the zone. There is no timeout. Decisiveness comes from
+Candle.classify; the BRR rule is not repeated here.
+ 
+The first candle processed for a Sweep must be the Sweep's own candle, so evaluation
+cannot silently start later; that candle may itself confirm, wait or invalidate. Later
+candles may have gaps but must not overlap or go backwards.
+ 
+`process_candle` returns the Confirmation or Invalidation THIS candle produced, otherwise
+None (still waiting, or already terminal earlier); use `status_for(sweep)` for the state.
+A Sweep produces at most one terminal event; later candles are still checked for validity
+but never change a terminal result and return None.
+ 
+Replay: supplying the latest candle of a Sweep again returns the same result; supplying
+the candle that produced a terminal event returns that event; both change nothing. Any
+other candle that opens before the previous one closed raises ValueError. A different
+Sweep with an already-seen identity is rejected. A rejected call changes nothing.
+ 
+This engine never creates or modifies swings, structure, BOS, CHOCH, pivots, zones,
+liquidity, sweeps, setups, entries, SL/TP, risk, news or execution; it does not read any
+other engine; and it contains no timeout and no filter beyond the locked sequence.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Union
+ 
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.confirmation import (
+    CONFIRMING_CLASS_FOR,
+    WRONG_CLASS_FOR,
+    Confirmation,
+    ConfirmationStatus,
+    Invalidation,
+    InvalidationReason,
+    closes_beyond_boundary,
+)
+from koffie.strategy.models.sweep import Sweep, SweepIdentity
+ 
+Event = Union[Confirmation, Invalidation]
+ 
+_TERMINAL = (ConfirmationStatus.CONFIRMED, ConfirmationStatus.INVALIDATED)
+ 
+ 
+class _Track:
+    """Mutable per-Sweep state, private to the engine."""
+ 
+    __slots__ = ("sweep", "status", "last_candle", "last_result", "terminal")
+ 
+    def __init__(self, sweep: Sweep, status: ConfirmationStatus, candle: Candle, result: Optional[Event]) -> None:
+        self.sweep = sweep
+        self.status = status
+        self.last_candle = candle
+        self.last_result = result
+        self.terminal: Optional[Event] = result
+ 
+ 
+class ConfirmationEngine:
+    def __init__(self) -> None:
+        self._tracks: Dict[SweepIdentity, _Track] = {}
+        self._confirmations: List[Confirmation] = []       # append-only, acceptance order
+        self._invalidations: List[Invalidation] = []       # append-only, acceptance order
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return Timeframe.M5
+ 
+    @property
+    def confirmations(self) -> Tuple[Confirmation, ...]:
+        """Every Confirmation produced, in acceptance order. Never removed."""
+        return tuple(self._confirmations)
+ 
+    @property
+    def invalidations(self) -> Tuple[Invalidation, ...]:
+        """Every Invalidation produced, in acceptance order. Never removed."""
+        return tuple(self._invalidations)
+ 
+    def _tracked(self, sweep: Sweep) -> Optional[_Track]:
+        if not isinstance(sweep, Sweep):
+            raise TypeError("sweep must be a Sweep")
+        track = self._tracks.get(sweep.identity)
+        return track if track is not None and track.sweep == sweep else None
+ 
+    def status_for(self, sweep: Sweep) -> Optional[ConfirmationStatus]:
+        """The current state of this Sweep's confirmation sequence, or None if it was never processed."""
+        track = self._tracked(sweep)
+        return track.status if track is not None else None
+ 
+    def confirmation_for(self, sweep: Sweep) -> Optional[Confirmation]:
+        track = self._tracked(sweep)
+        return track.terminal if track is not None and isinstance(track.terminal, Confirmation) else None
+ 
+    def invalidation_for(self, sweep: Sweep) -> Optional[Invalidation]:
+        track = self._tracked(sweep)
+        return track.terminal if track is not None and isinstance(track.terminal, Invalidation) else None
+ 
+    def confirmations_known_at(self, moment: datetime) -> Tuple[Confirmation, ...]:
+        """Confirmations whose candle had closed by `moment`, in acceptance order."""
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(c for c in self._confirmations if c.is_known_at(moment))
+ 
+    def invalidations_known_at(self, moment: datetime) -> Tuple[Invalidation, ...]:
+        """Invalidations whose candle had closed by `moment`, in acceptance order."""
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(i for i in self._invalidations if i.is_known_at(moment))
+ 
+    # --------------------------------------------------------------------- input
+    def process_candle(self, sweep: Sweep, candle: Candle, now: datetime) -> Optional[Event]:
+        """Evaluate one completed 5M candle for one Sweep.
+ 
+        Returns the Confirmation or Invalidation this candle produced, otherwise None.
+ 
+        Raises TypeError for wrong argument types (or mixed naive/aware datetimes) and
+        ValueError for a non-5M candle, a candle not closed at `now`, a conflicting Sweep,
+        a first candle that is not the Sweep's own candle, or an out-of-order candle.
+        Nothing is changed when an exception is raised.
+        """
+        if not isinstance(sweep, Sweep):
+            raise TypeError("sweep must be a Sweep")
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if candle.timeframe is not Timeframe.M5:
+            raise ValueError(
+                f"ConfirmationEngine works on 5M candles only, but received a {candle.timeframe.value} candle"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only completed candles may confirm")
+ 
+        identity = sweep.identity
+        track = self._tracks.get(identity)
+        if track is not None and track.sweep != sweep:
+            raise ValueError("a different sweep with the same identity was already seen; conflicting sweep rejected")
+ 
+        if track is None:
+            if candle != sweep.candle:
+                raise ValueError("the first candle processed for a sweep must be the sweep's own candle")
+        else:
+            if candle == track.last_candle:
+                return track.last_result                          # replay of the latest candle: no state change
+            if candle.open_time < track.last_candle.close_time:
+                if track.terminal is not None and track.terminal.candle == candle:
+                    return track.terminal                         # replay of the terminal candle: no state change
+                raise ValueError(
+                    "candles for a sweep must arrive in chronological order without overlap "
+                    "(candle opens before the previous candle closed)"
+                )
+ 
+        previous = ConfirmationStatus.WAITING_FOR_DECISIVE if track is None else track.status
+        status, event = self._evaluate(sweep, candle, now, previous)
+ 
+        # Commit only after validation and construction succeeded.
+        if track is None:
+            self._tracks[identity] = _Track(sweep, status, candle, event)
+        else:
+            track.status = status
+            track.last_candle = candle
+            track.last_result = event
+            if event is not None:
+                track.terminal = event
+        if isinstance(event, Confirmation):
+            self._confirmations.append(event)
+        elif isinstance(event, Invalidation):
+            self._invalidations.append(event)
+        return event
+ 
+    @staticmethod
+    def _evaluate(
+        sweep: Sweep, candle: Candle, now: datetime, previous: ConfirmationStatus
+    ) -> Tuple[ConfirmationStatus, Optional[Event]]:
+        """The locked sequence: (current state, completed candle) -> (new state, event)."""
+        if previous in _TERMINAL:
+            return previous, None                                  # a terminal result never changes
+        zone_type = sweep.zone_type
+        candle_class = candle.classify(now)                        # the existing classifier, closed candles only
+        if candle_class is CONFIRMING_CLASS_FOR[zone_type]:
+            return ConfirmationStatus.CONFIRMED, Confirmation(sweep, candle)
+        if candle_class is WRONG_CLASS_FOR[zone_type]:
+            if closes_beyond_boundary(zone_type, sweep.zone, candle):
+                return (
+                    ConfirmationStatus.INVALIDATED,
+                    Invalidation(sweep, candle, InvalidationReason.CLOSED_BEYOND_ZONE_BOUNDARY),
+                )
+            if previous is ConfirmationStatus.WAITING_FOR_SECOND_DECISIVE:
+                return (
+                    ConfirmationStatus.INVALIDATED,
+                    Invalidation(sweep, candle, InvalidationReason.SECOND_WRONG_DIRECTION_DECISIVE),
+                )
+            return ConfirmationStatus.WAITING_FOR_SECOND_DECISIVE, None
+        return previous, None                                      # NEUTRAL / ZERO_RANGE_ANOMALY: keep waiting
+"""EntryEngine for Koffie Strategy 1.
+
+Consumes confirmed Setups and creates immutable strategy-level Entry events.
+
+Entry price is exactly the close of the qualifying completed confirmation
+candle. MT5 execution, SL/TP, risk, position sizing, spread, and slippage are
+outside this component.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from koffie.strategy.engines.setup_engine import SetupEngine
+from koffie.strategy.models.entry import Entry
+from koffie.strategy.models.setup import Setup
+
+
+class EntryEngine:
+    """Creates strategy-level Entries from confirmed Setups."""
+
+    def __init__(self, setup_engine: SetupEngine) -> None:
+        if not isinstance(setup_engine, SetupEngine):
+            raise TypeError("setup_engine must be a SetupEngine")
+
+        self._setup_engine = setup_engine
+        self._entries: List[Entry] = []
+        self._by_setup: Dict[object, Entry] = {}
+
+    @property
+    def entries(self) -> Tuple[Entry, ...]:
+        """All Entries in creation order."""
+        return tuple(self._entries)
+
+    @property
+    def setup_engine(self) -> SetupEngine:
+        """The SetupEngine supplying confirmed Setups."""
+        return self._setup_engine
+
+    def entry_for(self, setup: Setup) -> Optional[Entry]:
+        """Return the Entry for a Setup, if one exists."""
+        if not isinstance(setup, Setup):
+            raise TypeError("setup must be a Setup")
+
+        return self._by_setup.get(setup.identity)
+
+    def create_entry(self, setup: Setup, now: datetime) -> Entry:
+        """Create one Entry for a confirmed Setup.
+
+        The Entry price is exactly confirmation.candle.close.
+
+        Repeating the same causal Setup returns the existing Entry without
+        mutating engine state.
+        """
+        if not isinstance(setup, Setup):
+            raise TypeError("setup must be a Setup")
+
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+
+        existing = self._by_setup.get(setup.identity)
+        if existing is not None:
+            return existing
+
+        if not self._setup_engine.can_create_trade(setup):
+            raise ValueError(
+                "an Entry can only be created from a confirmed, "
+                "unconsumed Setup"
+            )
+
+        confirmation = self._setup_engine.confirmation_for(setup)
+
+        if confirmation is None:
+            raise ValueError(
+                "the confirmed Setup has no Confirmation"
+            )
+
+        if not confirmation.is_known_at(now):
+            raise ValueError(
+                "the Entry cannot be created before the confirmation "
+                "candle has closed"
+            )
+
+        entry = Entry(
+            setup=setup,
+            confirmation=confirmation,
+        )
+
+        self._setup_engine.record_trade_created(setup, now)
+
+        self._entries.append(entry)
+        self._by_setup[setup.identity] = entry
+
+        return entry
+
+    def process(self, now: datetime) -> Tuple[Entry, ...]:
+        """Create Entries for confirmed Setups known at ``now``.
+
+        Only Entries created during this call are returned.
+        """
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+
+        created: List[Entry] = []
+
+        for setup in self._setup_engine.confirmed_setups_known_at(now):
+            if self.entry_for(setup) is not None:
+                continue
+
+            created.append(self.create_entry(setup, now))
+
+        return tuple(created)
+"""LiquidityEngine for Koffie Strategy 1.
+ 
+Records 5M liquidity levels from confirmed swings. It is configured for the 5M
+timeframe only.
+ 
+    confirmed 5M Swing -> one LiquidityLevel (every accepted swing, no filter)
+ 
+The engine receives swings that a SwingEngine has already confirmed, plus
+`now`. It never sees candles and never imports any other engine.
+ 
+Lifecycle: levels are append-only. Nothing here deletes, expires, merges,
+clusters, ranks or consumes a level, and no sweep state exists. Whether a level
+has been swept belongs to a later component.
+ 
+Queries take a Zone as an argument. The engine never stores a zone and does not
+depend on Zone state (it does not check whether the zone is known yet); that
+gate belongs to a later component.
+ 
+    levels_for(zone, moment)             known levels relevant to the zone
+    required_liquidity_for(zone, moment) the newest of those, or None
+ 
+Relevance (see LiquidityLevel.is_relevant_to): DEMAND -> swing LOW strictly
+below the zone low; SUPPLY -> swing HIGH strictly above the zone high. No
+distance limit, no tolerance, no time cutoff; a 5M level can serve a zone of
+any timeframe. "Newest" = latest `known_at`, then the highest swing `sequence`.
+ 
+Idempotency: every swing is keyed by its LiquidityIdentity. Supplying the exact
+same swing again returns the stored level and changes nothing. The same
+identity with different values raises ValueError (conflicting replay).
+ 
+Integrity checks (no strategy behaviour): the swing is a Swing on this
+timeframe; `now` is a datetime not earlier than the swing's confirmed_at; new
+swings arrive with non-decreasing confirmed_at. A rejected call changes
+nothing.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.liquidity import LiquidityIdentity, LiquidityLevel
+from koffie.strategy.models.swing import Swing
+from koffie.strategy.models.zone import Zone
+ 
+ 
+class LiquidityEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        if timeframe is not Timeframe.M5:
+            raise ValueError("LiquidityEngine is configured for the 5M timeframe only")
+        self._timeframe = timeframe
+        self._levels: List[LiquidityLevel] = []                    # append-only, acceptance order
+        self._by_identity: Dict[LiquidityIdentity, LiquidityLevel] = {}
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+ 
+    @property
+    def levels(self) -> Tuple[LiquidityLevel, ...]:
+        """Every level recorded, oldest first. Levels are never removed."""
+        return tuple(self._levels)
+ 
+    def level_for(self, identity: LiquidityIdentity) -> Optional[LiquidityLevel]:
+        """The level recorded for this identity, or None."""
+        if not isinstance(identity, LiquidityIdentity):
+            raise TypeError("identity must be a LiquidityIdentity")
+        return self._by_identity.get(identity)
+ 
+    def levels_known_at(self, moment: datetime) -> Tuple[LiquidityLevel, ...]:
+        """Levels whose `known_at` has been reached at `moment`, oldest first."""
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(level for level in self._levels if level.is_known_at(moment))
+ 
+    def levels_for(self, zone: Zone, moment: datetime) -> Tuple[LiquidityLevel, ...]:
+        """Known levels that are relevant to `zone` at `moment`, oldest first."""
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(
+            level
+            for level in self._levels
+            if level.is_known_at(moment) and level.is_relevant_to(zone)
+        )
+ 
+    def required_liquidity_for(self, zone: Zone, moment: datetime) -> Optional[LiquidityLevel]:
+        """The newest relevant known level, or None.
+ 
+        Newest = latest `known_at`, then the highest swing `sequence`.
+        """
+        candidates = self.levels_for(zone, moment)
+        if not candidates:
+            return None
+        return max(candidates, key=lambda level: (level.known_at, level.sequence))
+ 
+    # --------------------------------------------------------------------- input
+    def process_swing(self, swing: Swing, now: datetime) -> LiquidityLevel:
+        """Accept one confirmed swing and return its LiquidityLevel.
+ 
+        Raises TypeError for wrong argument types and ValueError for a wrong
+        timeframe, a `now` before the swing was confirmed, a conflicting replay
+        or an out-of-order swing. Nothing is changed when an exception is raised.
+        """
+        if not isinstance(swing, Swing):
+            raise TypeError("swing must be a Swing")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if swing.timeframe is not self._timeframe:
+            raise ValueError(
+                f"LiquidityEngine is configured for {self._timeframe.value}, "
+                f"but received a {swing.timeframe.value} swing"
+            )
+        if now < swing.confirmed_at:
+            raise ValueError("the swing is not confirmed yet at `now`; a level cannot exist before known_at")
+ 
+        identity = LiquidityIdentity.from_swing(swing)
+        stored = self._by_identity.get(identity)
+        if stored is not None:
+            if stored.swing != swing:
+                raise ValueError(
+                    "this swing identity was already recorded with different values; "
+                    "conflicting replay rejected"
+                )
+            return stored                                       # exact replay: no state change
+ 
+        if self._levels and swing.confirmed_at < self._levels[-1].known_at:
+            raise ValueError("swings must arrive in non-decreasing confirmed_at order")
+ 
+        level = LiquidityLevel(swing)
+ 
+        # Commit only after validation and construction succeeded.
+        self._levels.append(level)
+        self._by_identity[identity] = level
+        return level
+"""PivotEngine for Koffie Strategy 1.
+ 
+Selects the Pivot candle for a confirmed BOS on ONE timeframe.
+ 
+    bullish BOS -> most recent BEARISH_DECISIVE candle before the BOS candle
+    bearish BOS -> most recent BULLISH_DECISIVE candle before the BOS candle
+ 
+The search starts at the candle immediately before the BOS candle and walks
+backward through ALL completed history the engine has accepted. Candles that do
+not match (neutral, zero-range anomaly, same-colour decisive) are skipped and do
+not stop the search. There is no lookback limit and no size, price, ATR or
+distance rule. The BOS candle can never be its own Pivot.
+ 
+If no qualifying candle exists the outcome is NO_PIVOT_FOUND, recorded
+explicitly; the BOS stays valid and no fallback candle is invented.
+ 
+Causality: the Pivot is decided in the same call that supplies the BOS, from
+candles that had already closed. Outcomes are append-only and are never
+modified, replaced or deleted by later candles.
+ 
+Idempotency (owned by this engine, not by BOSEngine): every outcome is keyed by
+an immutable BOSIdentity built from the BOS's own fields. Supplying the exact
+same BOS event again together with the exact same, most recently accepted
+candle returns the stored outcome and changes nothing. If that identity is
+supplied with different BOS values, ValueError is raised. Any other repeated,
+overlapping or out-of-order candle is rejected by the normal validation.
+ 
+Integrity checks (no strategy behaviour): candle is a Candle on this timeframe
+and closed at `now`; it opens at or after the previous candle's close (gaps are
+fine, overlaps and repeats are not); a supplied BOS is a BOS on this timeframe
+that belongs to this candle (same candle_time and close_price). A rejected call
+changes nothing.
+ 
+NOT here: BOS/CHOCH detection, swings, structure, zones, liquidity, entries,
+risk, TP/SL or execution. This engine imports none of those engines.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.models.bos import BOS
+from koffie.strategy.models.candle import Candle, CandleClass, Timeframe
+from koffie.strategy.models.pivot import (
+    PIVOT_CANDLE_CLASS,
+    BOSIdentity,
+    Pivot,
+    PivotOutcome,
+    PivotStatus,
+)
+ 
+ 
+class PivotEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._candles: List[Tuple[Candle, CandleClass]] = []   # every accepted candle, oldest first
+        self._outcomes: List[PivotOutcome] = []                # append-only
+        self._by_identity: Dict[BOSIdentity, PivotOutcome] = {}
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+ 
+    @property
+    def history(self) -> Tuple[PivotOutcome, ...]:
+        """Every outcome (FOUND and NO_PIVOT_FOUND) in order, oldest first."""
+        return tuple(self._outcomes)
+ 
+    @property
+    def pivots(self) -> Tuple[Pivot, ...]:
+        """Only the Pivots that were found, in order, oldest first."""
+        return tuple(o.pivot for o in self._outcomes if o.pivot is not None)
+ 
+    @property
+    def candle_count(self) -> int:
+        return len(self._candles)
+ 
+    @property
+    def last_candle(self) -> Optional[Candle]:
+        return self._candles[-1][0] if self._candles else None
+ 
+    # --------------------------------------------------------------------- input
+    def process_candle(
+        self, candle: Candle, now: datetime, bos: Optional[BOS] = None
+    ) -> Optional[PivotOutcome]:
+        """Accept one CLOSED candle and, if `bos` is given, decide its Pivot.
+ 
+        Returns the PivotOutcome when a BOS is supplied, otherwise None.
+        Raises TypeError for wrong argument types and ValueError for a wrong
+        timeframe, an unfinished, repeated, overlapping or out-of-order candle,
+        or a BOS that does not belong to this candle. Nothing is changed when an
+        exception is raised.
+        """
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if bos is not None and not isinstance(bos, BOS):
+            raise TypeError("bos must be a BOS or None")
+        if candle.timeframe is not self._timeframe:
+            raise ValueError(
+                f"PivotEngine is configured for {self._timeframe.value}, "
+                f"but received a {candle.timeframe.value} candle"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be processed")
+ 
+        if bos is not None:
+            replay = self._recognize_replay(candle, bos)
+            if replay is not None:
+                return replay                                   # exact duplicate: no state change
+ 
+        if self._candles and candle.open_time < self._candles[-1][0].close_time:
+            raise ValueError(
+                "candles must be supplied in chronological order without overlap "
+                "(candle opens before the previous candle closed)"
+            )
+        if bos is not None:
+            if bos.timeframe is not self._timeframe:
+                raise ValueError(
+                    f"PivotEngine is configured for {self._timeframe.value}, "
+                    f"but received a {bos.timeframe.value} BOS"
+                )
+            if bos.candle_time != candle.open_time:
+                raise ValueError("the BOS does not belong to the current candle (candle_time differs)")
+            if bos.close_price != candle.close:
+                raise ValueError("the BOS does not belong to the current candle (close_price differs)")
+ 
+        candle_class = candle.classify(now)
+        outcome = self._select(bos) if bos is not None else None
+ 
+        # Commit only after validation and construction succeeded.
+        self._candles.append((candle, candle_class))
+        if outcome is not None:
+            self._outcomes.append(outcome)
+            self._by_identity[outcome.identity] = outcome
+        return outcome
+ 
+    # ------------------------------------------------------------------ internals
+    def _recognize_replay(self, candle: Candle, bos: BOS) -> Optional[PivotOutcome]:
+        """Return the stored outcome for an exact duplicate BOS replay, else None.
+ 
+        A replay is recognised only when the BOS identity is already recorded AND
+        the supplied candle is exactly the most recently accepted candle. If the
+        identity matches but the BOS values differ, the record conflicts with the
+        stored one and ValueError is raised. Anything else falls through to the
+        normal validation (which rejects repeated/overlapping candles).
+        """
+        stored = self._by_identity.get(BOSIdentity.from_bos(bos))
+        if stored is None or not self._candles or candle != self._candles[-1][0]:
+            return None
+        if bos != stored.bos:
+            raise ValueError(
+                "this BOS identity was already recorded with different values; "
+                "conflicting BOS record rejected"
+            )
+        return stored
+ 
+    def _select(self, bos: BOS) -> PivotOutcome:
+        """Walk backward over completed candles; first opposite-colour decisive wins.
+ 
+        The BOS candle is not in the history yet, so it cannot select itself.
+        """
+        wanted = PIVOT_CANDLE_CLASS[bos.direction]
+        for candle, candle_class in reversed(self._candles):
+            if candle_class is wanted:
+                pivot = Pivot(bos, candle.open_time, candle.high, candle.low, candle_class)
+                return PivotOutcome(bos, PivotStatus.FOUND, pivot)
+        return PivotOutcome(bos, PivotStatus.NO_PIVOT_FOUND)
+"""SetupEngine for Koffie Strategy 1.
+ 
+Coordinates the Setup lifecycle on completed 5M candles:
+ 
+    (Zone, completed 5M candle) -> the Setup this candle started or advanced, or None
+ 
+    NO_SETUP -> ZONE_TOUCHED -> WAITING_FOR_SWEEP -> SWEPT
+             -> WAITING_FOR_CONFIRMATION -> CONFIRMED -> TRADE_CREATED
+    INVALIDATED is terminal.
+ 
+The engine only COORDINATES. Touch is the minimal locked test (close inside the
+zone, both boundaries inclusive). Sweeps are produced by the existing SweepEngine
+and confirmation by the existing ConfirmationEngine; this engine never repeats
+their rules, never classifies candles and never creates or changes zones,
+liquidity, sweeps or confirmations.
+ 
+Independent Setups
+------------------
+Every Setup owns a PRIVATE SweepEngine and a PRIVATE ConfirmationEngine, created
+when its touch starts it and fed only from that touch candle onward. This is how
+a persistent zone can later start a completely new Setup with a genuinely new
+Sweep: the existing engines record one Sweep per (zone, liquidity level) pair and
+one confirmation track per Sweep identity, so a shared instance could never
+produce a second Sweep of the same level. Per-Setup instances need no change to
+those engines, and a Sweep that happened BEFORE a touch never reaches a Setup
+because that Setup's SweepEngine has not seen those candles. The shared
+LiquidityEngine is only read.
+ 
+Per candle, in this fixed order and with no artificial delay between steps:
+ 
+    1. active Setup of the zone: feed the candle to its sweep stage, then (if a
+       Sweep exists) to its confirmation stage; a later touch is ignored
+    2. no active Setup, zone not consumed, candle closes inside the zone:
+       a new Setup starts and the SAME candle is fed to its sweep stage, then to
+       its confirmation stage if it swept
+ 
+So touch, Sweep and Confirmation can all happen on one candle. A candle advances
+at most one Setup of a zone: the candle that resolves a Setup cannot also be the
+touch that starts the next one.
+ 
+A Setup is "active" until its Sweep/Confirmation sequence is over (CONFIRMED,
+TRADE_CREATED or INVALIDATED). A resolved Setup stays in history; a new
+qualifying touch may start a new independent Setup while the zone is unconsumed.
+There is no timeout and no other invalidation rule while waiting.
+ 
+Trade creation / zone consumption
+---------------------------------
+Confirmation and invalidation never consume a zone. Only `record_trade_created`,
+called by the downstream Entry/Trade component once a trade is ACTUALLY created,
+moves a CONFIRMED Setup to TRADE_CREATED and consumes its zone for entry. A zone
+produces at most one entry, and one causal confirmation event (same confirming
+candle, same liquidity) produces at most one trade, even when overlapping zones
+were all confirmed by it. Other Setups, confirmed or not, stay in history. This
+engine never builds an entry, SL, TP, risk check or order.
+ 
+Integrity checks (no strategy behaviour): zone / candle / now have the right
+types; the candle is 5M and CLOSED at `now`; it opens at or after the zone
+existed; a zone identity is always the same zone; candles for one zone arrive in
+chronological order without overlap. Replay: supplying the latest candle of a zone
+again, or a candle that started or advanced a Setup, returns that result and
+changes nothing. A rejected call changes nothing.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.engines.confirmation_engine import ConfirmationEngine
+from koffie.strategy.engines.liquidity_engine import LiquidityEngine
+from koffie.strategy.engines.sweep_engine import SweepEngine
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.confirmation import Confirmation, Invalidation
+from koffie.strategy.models.pivot import BOSIdentity
+from koffie.strategy.models.setup import (
+    ConfirmationEventKey,
+    Setup,
+    SetupIdentity,
+    SetupStatus,
+    SetupTransition,
+    is_touch,
+)
+from koffie.strategy.models.sweep import Sweep
+from koffie.strategy.models.zone import Zone
+ 
+ 
+class _Track:
+    """Mutable per-Setup state, private to the engine."""
+ 
+    __slots__ = (
+        "setup", "status", "sweep_engine", "confirmation_engine",
+        "sweep", "confirmation", "invalidation", "transitions",
+    )
+ 
+    def __init__(self, setup: Setup, liquidity: LiquidityEngine) -> None:
+        self.setup = setup
+        self.status = SetupStatus.ZONE_TOUCHED
+        self.sweep_engine = SweepEngine(liquidity)
+        self.confirmation_engine = ConfirmationEngine()
+        self.sweep: Optional[Sweep] = None
+        self.confirmation: Optional[Confirmation] = None
+        self.invalidation: Optional[Invalidation] = None
+        self.transitions: List[SetupTransition] = [SetupTransition(SetupStatus.ZONE_TOUCHED, setup.known_at)]
+ 
+ 
+class SetupEngine:
+    def __init__(self, liquidity_engine: LiquidityEngine) -> None:
+        if not isinstance(liquidity_engine, LiquidityEngine):
+            raise TypeError("liquidity_engine must be a LiquidityEngine")
+        self._liquidity = liquidity_engine                                  # only READ
+        self._setups: List[Setup] = []                                      # append-only, acceptance order
+        self._tracks: Dict[SetupIdentity, _Track] = {}
+        self._by_zone: Dict[BOSIdentity, List[SetupIdentity]] = {}
+        self._zones: Dict[BOSIdentity, Zone] = {}                           # zone identity -> the zone seen
+        self._last: Dict[BOSIdentity, Tuple[Candle, Optional[Setup]]] = {}  # latest candle + result per zone
+        self._changes: Dict[BOSIdentity, List[Tuple[Candle, Setup]]] = {}   # candles that started/advanced a Setup
+        self._consumed: Dict[BOSIdentity, Setup] = {}                       # zone identity -> Setup that took the entry
+        self._trade_events: Dict[ConfirmationEventKey, Setup] = {}          # causal event -> Setup that took the trade
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return Timeframe.M5
+ 
+    @property
+    def setups(self) -> Tuple[Setup, ...]:
+        """Every Setup ever started, in the order they started. Never removed."""
+        return tuple(self._setups)
+ 
+    def _tracked(self, setup: Setup) -> Optional[_Track]:
+        if not isinstance(setup, Setup):
+            raise TypeError("setup must be a Setup")
+        track = self._tracks.get(setup.identity)
+        return track if track is not None and track.setup == setup else None
+ 
+    def setups_for_zone(self, zone: Zone) -> Tuple[Setup, ...]:
+        """Every Setup of this zone, in the order they started."""
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        tracks = (self._tracks[i] for i in self._by_zone.get(zone.identity, ()))
+        return tuple(t.setup for t in tracks if t.setup.zone == zone)
+ 
+    def active_setup_for(self, zone: Zone) -> Optional[Setup]:
+        """The zone's Setup whose Sweep/Confirmation sequence is still running, or None."""
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        track = self._active_track(zone.identity)
+        return track.setup if track is not None and track.setup.zone == zone else None
+ 
+    def status_for(self, setup: Setup) -> Optional[SetupStatus]:
+        """The current lifecycle status of this Setup, or None if it is not tracked."""
+        track = self._tracked(setup)
+        return track.status if track is not None else None
+ 
+    def status_for_zone(self, zone: Zone) -> SetupStatus:
+        """Status of the zone's active Setup, or NO_SETUP when it has none."""
+        active = self.active_setup_for(zone)
+        return self._tracks[active.identity].status if active is not None else SetupStatus.NO_SETUP
+ 
+    def sweep_for(self, setup: Setup) -> Optional[Sweep]:
+        track = self._tracked(setup)
+        return track.sweep if track is not None else None
+ 
+    def confirmation_for(self, setup: Setup) -> Optional[Confirmation]:
+        track = self._tracked(setup)
+        return track.confirmation if track is not None else None
+ 
+    def invalidation_for(self, setup: Setup) -> Optional[Invalidation]:
+        track = self._tracked(setup)
+        return track.invalidation if track is not None else None
+ 
+    def transitions_for(self, setup: Setup) -> Tuple[SetupTransition, ...]:
+        """Every lifecycle step of this Setup in order (empty if it is not tracked)."""
+        track = self._tracked(setup)
+        return tuple(track.transitions) if track is not None else ()
+ 
+    def confirmed_setups_known_at(self, moment: datetime) -> Tuple[Setup, ...]:
+        """CONFIRMED Setups (no trade yet) whose confirmation had closed by `moment`, oldest first.
+ 
+        This is what the future Entry component reads. It never includes a Setup whose
+        zone has been consumed.
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(
+            t.setup for t in (self._tracks[s.identity] for s in self._setups)
+            if t.status is SetupStatus.CONFIRMED and t.confirmation.is_known_at(moment)
+            and t.setup.zone.identity not in self._consumed
+        )
+ 
+    def confirmation_event_key_for(self, setup: Setup) -> Optional[ConfirmationEventKey]:
+        """The causal event a CONFIRMED (or TRADE_CREATED) Setup came from, else None."""
+        track = self._tracked(setup)
+        return self._event_key(track) if track is not None else None
+ 
+    @staticmethod
+    def _event_key(track: _Track) -> Optional[ConfirmationEventKey]:
+        if track.confirmation is None:
+            return None
+        return ConfirmationEventKey(track.confirmation.candle.open_time, track.sweep.level.identity)
+ 
+    def is_zone_consumed(self, zone: Zone) -> bool:
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        return zone.identity in self._consumed
+ 
+    def consumed_by(self, zone: Zone) -> Optional[Setup]:
+        """The Setup whose actual trade consumed this zone for entry, or None."""
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        return self._consumed.get(zone.identity)
+ 
+    def can_create_trade(self, setup: Setup) -> bool:
+        """True when this Setup is CONFIRMED, its zone is unconsumed and its causal event has no trade yet."""
+        track = self._tracked(setup)
+        if track is None or track.status is not SetupStatus.CONFIRMED:
+            return False
+        return (setup.zone.identity not in self._consumed
+                and self._event_key(track) not in self._trade_events)
+ 
+    # --------------------------------------------------------------------- input
+    def process_candle(self, zone: Zone, candle: Candle, now: datetime) -> Optional[Setup]:
+        """Evaluate one completed 5M candle against one zone.
+ 
+        Returns the Setup this candle STARTED or whose status it CHANGED, otherwise
+        None (no touch, nothing happened, or the zone is consumed).
+ 
+        Raises TypeError for wrong argument types (or mixed naive/aware datetimes) and
+        ValueError for a non-5M candle, a candle not closed at `now`, a candle opening
+        before the zone existed, a conflicting zone or an out-of-order candle. Nothing
+        is changed when an exception is raised.
+        """
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if candle.timeframe is not Timeframe.M5:
+            raise ValueError(
+                f"SetupEngine works on 5M candles only, but received a {candle.timeframe.value} candle"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only completed candles may advance a setup")
+        if candle.open_time < zone.created_at:
+            raise ValueError("the zone did not exist yet when this candle opened")
+ 
+        zone_id = zone.identity
+        seen_zone = self._zones.get(zone_id)
+        if seen_zone is not None and seen_zone != zone:
+            raise ValueError("a different zone with the same identity was already seen; conflicting zone rejected")
+ 
+        last = self._last.get(zone_id)
+        if last is not None:
+            last_candle, last_result = last
+            if candle == last_candle:
+                return last_result                                   # replay of the latest candle: no state change
+            if candle.open_time < last_candle.close_time:
+                for earlier_candle, earlier_result in self._changes.get(zone_id, ()):
+                    if earlier_candle == candle:
+                        return earlier_result                        # replay of an earlier result candle: no state change
+                raise ValueError(
+                    "candles for a zone must arrive in chronological order without overlap "
+                    "(candle opens before the previous candle closed)"
+                )
+ 
+        result: Optional[Setup] = None
+        active = self._active_track(zone_id)
+        if active is not None:
+            if self._advance(active, candle, now):
+                result = active.setup
+        elif zone_id not in self._consumed and is_touch(zone, candle):
+            track = _Track(Setup(zone, candle), self._liquidity)    # not registered until it has been fed
+            track.status = SetupStatus.WAITING_FOR_SWEEP
+            track.transitions.append(SetupTransition(SetupStatus.WAITING_FOR_SWEEP, candle.close_time))
+            self._advance(track, candle, now)                       # the touch candle itself may sweep (and confirm)
+            self._register(track)
+            result = track.setup
+ 
+        # Commit only after validation and construction succeeded.
+        self._zones[zone_id] = zone
+        self._last[zone_id] = (candle, result)
+        if result is not None:
+            self._changes.setdefault(zone_id, []).append((candle, result))
+        return result
+ 
+    def record_trade_created(self, setup: Setup, now: datetime) -> None:
+        """Called by the downstream Entry/Trade component when a trade was ACTUALLY created.
+ 
+        Moves a CONFIRMED Setup to TRADE_CREATED and consumes its zone for entry. Calling it
+        again for the same Setup is a no-op. Raises TypeError for wrong types and ValueError
+        when the Setup is unknown or not CONFIRMED, `now` precedes the confirmation, the zone
+        is already consumed, or the same causal confirmation event already produced a trade.
+        Nothing is changed when an exception is raised.
+        """
+        if not isinstance(setup, Setup):
+            raise TypeError("setup must be a Setup")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        track = self._tracked(setup)
+        if track is None:
+            raise ValueError("this setup is not tracked by the engine")
+        if track.status is SetupStatus.TRADE_CREATED:
+            return                                                   # replay: no state change
+        if track.status is not SetupStatus.CONFIRMED:
+            raise ValueError(f"a trade can only follow a CONFIRMED setup, not {track.status.value}")
+        if not track.confirmation.is_known_at(now):
+            raise ValueError("a trade cannot be created before the confirmation is known")
+        zone_id = setup.zone.identity
+        if zone_id in self._consumed:
+            raise ValueError("this zone was already consumed for entry")
+        key = self._event_key(track)
+        if key in self._trade_events:
+            raise ValueError("this causal confirmation event already produced a trade")
+ 
+        # Commit only after validation succeeded.
+        track.status = SetupStatus.TRADE_CREATED
+        track.transitions.append(SetupTransition(SetupStatus.TRADE_CREATED, now))
+        self._consumed[zone_id] = setup
+        self._trade_events[key] = setup
+ 
+    # ------------------------------------------------------------------ internals
+    def _active_track(self, zone_id: BOSIdentity) -> Optional[_Track]:
+        for identity in reversed(self._by_zone.get(zone_id, ())):
+            track = self._tracks[identity]
+            if track.status.is_active:
+                return track
+        return None
+ 
+    def _register(self, track: _Track) -> None:
+        identity = track.setup.identity
+        self._setups.append(track.setup)
+        self._tracks[identity] = track
+        self._by_zone.setdefault(track.setup.zone.identity, []).append(identity)
+ 
+    @staticmethod
+    def _move(track: _Track, status: SetupStatus, at: datetime) -> None:
+        track.status = status
+        track.transitions.append(SetupTransition(status, at))
+ 
+    def _advance(self, track: _Track, candle: Candle, now: datetime) -> bool:
+        """Feed one candle to the Setup's own Sweep and Confirmation stages. True if its status changed."""
+        before = track.status
+        if track.status is SetupStatus.WAITING_FOR_SWEEP:
+            sweep = track.sweep_engine.process_candle(track.setup.zone, candle, now)
+            if sweep is not None:
+                track.sweep = sweep
+                self._move(track, SetupStatus.SWEPT, candle.close_time)
+                self._move(track, SetupStatus.WAITING_FOR_CONFIRMATION, candle.close_time)
+        if track.status is SetupStatus.WAITING_FOR_CONFIRMATION:
+            event = track.confirmation_engine.process_candle(track.sweep, candle, now)
+            if isinstance(event, Confirmation):
+                track.confirmation = event
+                self._move(track, SetupStatus.CONFIRMED, candle.close_time)
+            elif isinstance(event, Invalidation):
+                track.invalidation = event
+                self._move(track, SetupStatus.INVALIDATED, candle.close_time)
+        return track.status is not before
+"""SLTPEngine for Koffie Strategy 1.
+
+Produces immutable SLTP records from Entry objects. Reads only. Never consumes
+a zone, never records a trade, never touches Risk, Validation or Execution.
+
+Locked behaviour
+----------------
+- One SLTP per Entry, keyed by Entry.identity. Supplying the same Entry again
+  returns the stored SLTP and changes nothing.
+- An Entry with invalid geometry (BUY stop >= entry price; SELL stop <= entry
+  price) is rejected with ValueError, not silently corrected.
+- SL/TP never reads zones, liquidity levels, pivots, protected swings, or
+  opposite zones. The only references are the Entry, its Confirmation, its
+  Sweep, and the Sweep's candle.
+- No buffer, no offset, no ATR, no spread, no execution, no MT5, no news.
+
+If an EntryEngine is injected, process(now) creates SLTPs for all Entries
+known at now. Otherwise create_sl_tp(entry, now) is the only entry point.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
+from koffie.strategy.engines.entry_engine import EntryEngine
+from koffie.strategy.models.entry import Entry
+from koffie.strategy.models.sl_tp import SLTP
+
+
+class SLTPEngine:
+    def __init__(self, entry_engine: Optional[EntryEngine] = None) -> None:
+        if entry_engine is not None and not isinstance(entry_engine, EntryEngine):
+            raise TypeError("entry_engine must be an EntryEngine or None")
+
+        self._entry_engine = entry_engine
+        self._sl_tps: List[SLTP] = []
+        self._by_entry: Dict[object, SLTP] = {}
+
+    # ------------------------------------------------------------- read-only state
+
+    @property
+    def entry_engine(self) -> Optional[EntryEngine]:
+        return self._entry_engine
+
+    @property
+    def sl_tps(self) -> Tuple[SLTP, ...]:
+        """Every SLTP created, in acceptance order. Never removed."""
+        return tuple(self._sl_tps)
+
+    def sl_tp_for(self, entry: Entry) -> Optional[SLTP]:
+        """The SLTP recorded for this Entry, or None."""
+        if not isinstance(entry, Entry):
+            raise TypeError("entry must be an Entry")
+        return self._by_entry.get(entry.identity)
+
+    def sl_tps_known_at(self, moment: datetime) -> Tuple[SLTP, ...]:
+        """SLTPs whose Entry is known by moment, in acceptance order."""
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+
+        return tuple(
+            sl_tp
+            for sl_tp in self._sl_tps
+            if sl_tp.is_known_at(moment)
+        )
+
+    # --------------------------------------------------------------------- input
+
+    def create_sl_tp(self, entry: Entry, now: datetime) -> SLTP:
+        """Create or return the SLTP for one Entry.
+
+        Idempotent per Entry.identity. Raises TypeError for wrong argument
+        types and ValueError when the Entry is not yet known or has invalid
+        SL geometry. Nothing changes when an exception is raised.
+        """
+        if not isinstance(entry, Entry):
+            raise TypeError("entry must be an Entry")
+
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+
+        if now < entry.known_at:
+            raise ValueError("the Entry is not known yet at `now`")
+
+        existing = self._by_entry.get(entry.identity)
+        if existing is not None:
+            return existing
+
+        sl_tp = SLTP(entry)
+
+        # Commit only after construction succeeded.
+        self._sl_tps.append(sl_tp)
+        self._by_entry[entry.identity] = sl_tp
+
+        return sl_tp
+
+    def process(self, now: datetime) -> Tuple[SLTP, ...]:
+        """Create SLTPs for all Entries known at now.
+
+        Requires an injected EntryEngine.
+
+        Returns only the SLTPs created during this call.
+        """
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+
+        if self._entry_engine is None:
+            raise TypeError("EntryEngine is required for process()")
+
+        created: List[SLTP] = []
+
+        for entry in self._entry_engine.entries:
+            if entry.known_at <= now and self.sl_tp_for(entry) is None:
+                created.append(self.create_sl_tp(entry, now))
+
+        return tuple(created)
+"""StructureEngine for Koffie Strategy 1 (spec sections 8-10, 13, 35).
+ 
+Holds the structure state of ONE timeframe. It is handed the swings a
+SwingEngine confirms (it never reads candles or SwingEngine) and applies the
+locked literal rules:
+ 
+* HH/HL/LL/LH compare CONSECUTIVE confirmed structural swings of the same
+  type ("active" = most recently confirmed), never historical extremes.
+  Equal prices qualify as none of them.
+* After EACH supplied swing the pair is evaluated:
+    HH + HL            -> BULLISH   (if not already BULLISH)
+    LL + LH            -> BEARISH   (if not already BEARISH)
+    mixed/tied/partial -> state unchanged
+  This applies from every state: UNDETERMINED, a direct BULLISH<->BEARISH
+  flip, and restoration out of REVALUATING. The newest swing may combine with
+  the existing opposite swing; nothing requires swings to post-date a CHOCH.
+* enter_revaluating(at) is the interface a later BOS/CHOCH component calls.
+  It only moves BULLISH/BEARISH -> REVALUATING and never evaluates a pair, so
+  an old HH+HL / LL+LH pair cannot restore the trend at the CHOCH instant;
+  evaluation happens only when a newly confirmed swing is supplied.
+* An outside bar's swings arrive as HIGH then LOW and are evaluated one by
+  one, in the order supplied, with no special case.
+ 
+NOT in this engine: BOS or CHOCH detection, zones, liquidity, entries, risk,
+news, TP/SL or execution.
+ 
+Integrity checks (no strategy behaviour): supplied swings must be Swing
+objects on this timeframe, with confirmed_at not earlier than the previous
+supplied swing's and strictly increasing candle_time per swing type. `sequence`
+is metadata only: it is never used to order, skip or reject swings (gaps and
+any starting value are fine). One consequence comes from the existing
+StructureSnapshot model, not from this engine: within a single swing type the
+prior swing's sequence must be lower than the active swing's, so a call that
+would violate that is rejected as a whole. A rejected call changes nothing.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import List, Optional, Sequence, Tuple
+ 
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.structure import (
+    DirectionalPermission,
+    StructureSnapshot,
+    StructureState,
+    StructureTransition,
+    TransitionReason,
+    classify_pair,
+    compare_highs,
+    compare_lows,
+)
+from koffie.strategy.models.swing import Swing, SwingType
+ 
+ 
+class StructureEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._snapshot = StructureSnapshot(timeframe)
+        self._transitions: List[StructureTransition] = []
+        self._last_confirmed_at: Optional[datetime] = None
+ 
+    # ------------------------------------------------------------------
+    # Read-only state
+    # ------------------------------------------------------------------
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+ 
+    @property
+    def snapshot(self) -> StructureSnapshot:
+        return self._snapshot
+ 
+    @property
+    def state(self) -> StructureState:
+        return self._snapshot.state
+ 
+    @property
+    def permission(self) -> DirectionalPermission:
+        return self._snapshot.permission
+ 
+    @property
+    def protected_swing(self) -> Optional[Swing]:
+        return self._snapshot.protected_swing
+ 
+    @property
+    def transitions(self) -> Tuple[StructureTransition, ...]:
+        """Append-only history of state changes, oldest first."""
+        return tuple(self._transitions)
+ 
+    # ------------------------------------------------------------------
+    # Swings in
+    # ------------------------------------------------------------------
+    def process_swings(self, swings: Sequence[Swing]) -> List[StructureTransition]:
+        """Apply newly confirmed swings in order; return the transitions made.
+ 
+        Raises TypeError for a non-list/tuple argument or a non-Swing item,
+        and ValueError for a wrong timeframe or an ordering violation
+        (confirmed_at or same-type candle_time). Nothing is changed when an
+        exception is raised.
+        """
+        if not isinstance(swings, (list, tuple)):
+            raise TypeError("swings must be a list or tuple of Swing objects")
+ 
+        snap = self._snapshot
+        state = snap.state
+        active_high, prior_high = snap.active_swing_high, snap.prior_swing_high
+        active_low, prior_low = snap.active_swing_low, snap.prior_swing_low
+        last_confirmed = self._last_confirmed_at
+        made: List[StructureTransition] = []
+ 
+        for swing in swings:
+            self._check_swing(swing, last_confirmed, active_high, active_low)
+            last_confirmed = swing.confirmed_at
+ 
+            if swing.swing_type is SwingType.HIGH:
+                prior_high, active_high = active_high, swing
+            else:
+                prior_low, active_low = active_low, swing
+ 
+            pair = self._directional_pair(active_high, prior_high, active_low, prior_low)
+            if pair is not None and pair is not state:
+                made.append(
+                    StructureTransition(
+                        timeframe=self._timeframe,
+                        from_state=state,
+                        to_state=pair,
+                        reason=TransitionReason.DIRECTIONAL_PAIR,
+                        at=swing.confirmed_at,
+                        trigger_swing_sequence=swing.sequence,
+                    )
+                )
+                state = pair
+ 
+        new_snapshot = StructureSnapshot(
+            self._timeframe, state, active_high, prior_high, active_low, prior_low
+        )
+ 
+        # Commit only after every swing was accepted.
+        self._snapshot = new_snapshot
+        self._last_confirmed_at = last_confirmed
+        self._transitions.extend(made)
+        return list(made)
+ 
+    def _check_swing(
+        self,
+        swing: Swing,
+        last_confirmed_at: Optional[datetime],
+        active_high: Optional[Swing],
+        active_low: Optional[Swing],
+    ) -> None:
+        if not isinstance(swing, Swing):
+            raise TypeError("swings must contain Swing objects")
+        if swing.timeframe is not self._timeframe:
+            raise ValueError(
+                f"StructureEngine is configured for {self._timeframe.value}, "
+                f"but received a {swing.timeframe.value} swing"
+            )
+        if last_confirmed_at is not None and swing.confirmed_at < last_confirmed_at:
+            raise ValueError("swing confirmed_at goes backwards")
+        same_type_active = active_high if swing.swing_type is SwingType.HIGH else active_low
+        if same_type_active is not None and swing.candle_time <= same_type_active.candle_time:
+            raise ValueError("swing candle_time must increase within each swing type")
+ 
+    @staticmethod
+    def _directional_pair(
+        active_high: Optional[Swing],
+        prior_high: Optional[Swing],
+        active_low: Optional[Swing],
+        prior_low: Optional[Swing],
+    ) -> Optional[StructureState]:
+        high_relation = (
+            compare_highs(active_high, prior_high)
+            if active_high is not None and prior_high is not None else None
+        )
+        low_relation = (
+            compare_lows(active_low, prior_low)
+            if active_low is not None and prior_low is not None else None
+        )
+        return classify_pair(high_relation, low_relation)
+ 
+    # ------------------------------------------------------------------
+    # CHOCH interface (detection lives in a later component)
+    # ------------------------------------------------------------------
+    def enter_revaluating(self, at: datetime) -> StructureTransition:
+        """Move BULLISH/BEARISH -> REVALUATING because the protected swing broke.
+ 
+        `at` is when the breaking candle closed. Raises ValueError from any
+        other state and TypeError if `at` is not a datetime; nothing changes
+        on error. No pair is evaluated here.
+        """
+        if not isinstance(at, datetime):
+            raise TypeError("at must be a datetime")
+        snap = self._snapshot
+        if snap.state not in (StructureState.BULLISH, StructureState.BEARISH):
+            raise ValueError(
+                f"can only enter REVALUATING from BULLISH or BEARISH, not {snap.state.value}"
+            )
+        transition = StructureTransition(
+            timeframe=self._timeframe,
+            from_state=snap.state,
+            to_state=StructureState.REVALUATING,
+            reason=TransitionReason.CHOCH,
+            at=at,
+        )
+        new_snapshot = StructureSnapshot(
+            self._timeframe,
+            StructureState.REVALUATING,
+            snap.active_swing_high, snap.prior_swing_high,
+            snap.active_swing_low, snap.prior_swing_low,
+        )
+        self._snapshot = new_snapshot
+        self._transitions.append(transition)
+        return transition
+"""StructureProcessor: the caller that runs ONE closed candle through the engines.
+
+There was no production caller before this module: SwingEngine, StructureEngine,
+BOSEngine and CHOCHEngine each work on their own and were only ever wired
+together by the test harnesses. This is the smallest piece that does that wiring
+for ONE timeframe. It contains no rules of its own; every rule stays in the
+engine that owns it.
+
+Per closed candle, in this order:
+
+    1. SwingEngine.process_candle      -> newly confirmed swings
+    2. StructureEngine.process_swings  -> updated StructureSnapshot
+    3. CHOCHEngine.process_candle      -> CHOCH event or None (detection only)
+    4. BOSEngine.process_candle        -> BOS event or None (same snapshot)
+    5. if a CHOCH was returned:
+           structure.enter_revaluating(candle.close_time)
+
+Step 5 is the ONLY place the structure moves to REVALUATING. CHOCHEngine never
+does it. A CHOCH does not itself establish a new trend: the state stays
+REVALUATING until later confirmed swings form a directional pair, which
+StructureEngine decides on its own.
+
+BOS and CHOCH are separate events and are returned separately, never merged.
+Each engine applies its own close-based rule to the same snapshot; there is no
+precedence rule between them.
+
+Only closed candles are accepted (each engine enforces it), so the transition is
+made only after the breaking candle has closed, and `at` is its close time.
+
+Failure behaviour: every input check happens in SwingEngine.process_candle,
+before anything is changed, so a rejected candle leaves all four engines exactly
+as they were.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Optional, Tuple
+
+from koffie.strategy.engines.bos_engine import BOSEngine
+from koffie.strategy.engines.choch_engine import CHOCHEngine
+from koffie.strategy.engines.structure_engine import StructureEngine
+from koffie.strategy.engines.swing_engine import SwingEngine
+from koffie.strategy.models.bos import BOS
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.choch import CHOCH
+from koffie.strategy.models.structure import StructureSnapshot, StructureTransition
+from koffie.strategy.models.swing import Swing
+
+
+@dataclass(frozen=True)
+class CandleResult:
+    """What one closed candle produced. Every field is separate on purpose.
+
+    swings                newly confirmed swings (zero, one or two)
+    structure_transitions state changes made by those swings (directional pairs)
+    choch                 the CHOCH event, or None
+    bos                   the BOS event, or None (independent of choch)
+    revaluating           the CHOCH transition into REVALUATING, or None
+    snapshot              the structure after everything above
+    """
+
+    swings: Tuple[Swing, ...]
+    structure_transitions: Tuple[StructureTransition, ...]
+    choch: Optional[CHOCH]
+    bos: Optional[BOS]
+    revaluating: Optional[StructureTransition]
+    snapshot: StructureSnapshot
+
+
+class StructureProcessor:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._swing = SwingEngine(timeframe)
+        self._structure = StructureEngine(timeframe)
+        self._choch = CHOCHEngine(timeframe)
+        self._bos = BOSEngine(timeframe)
+
+    # ------------------------------------------------------------------
+    # Read-only access to the engines it drives
+    # ------------------------------------------------------------------
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+
+    @property
+    def swing_engine(self) -> SwingEngine:
+        return self._swing
+
+    @property
+    def structure(self) -> StructureEngine:
+        return self._structure
+
+    @property
+    def choch_engine(self) -> CHOCHEngine:
+        return self._choch
+
+    @property
+    def bos_engine(self) -> BOSEngine:
+        return self._bos
+
+    # ------------------------------------------------------------------
+    # Processing
+    # ------------------------------------------------------------------
+    def process_candle(self, candle: Candle, now: datetime) -> CandleResult:
+        """Run one CLOSED candle through the whole flow and return what it produced.
+
+        Raises whatever the engines raise (TypeError for wrong argument types
+        or mixed naive/aware datetimes, ValueError for a wrong timeframe, an
+        unfinished, repeated or overlapping candle). Nothing is changed when
+        an exception is raised.
+        """
+        swings = self._swing.process_candle(candle, now)            # validates first
+        structure_transitions = self._structure.process_swings(swings)
+        snapshot = self._structure.snapshot
+
+        choch = self._choch.process_candle(candle, now, snapshot)   # detection only
+        bos = self._bos.process_candle(candle, now, snapshot)       # same snapshot
+
+        revaluating = None
+        if choch is not None:
+            revaluating = self._structure.enter_revaluating(candle.close_time)
+
+        return CandleResult(
+            swings=tuple(swings),
+            structure_transitions=tuple(structure_transitions),
+            choch=choch,
+            bos=bos,
+            revaluating=revaluating,
+            snapshot=self._structure.snapshot,
+        )
+"""SweepEngine for Koffie Strategy 1.
+ 
+Detects when a completed 5M candle sweeps the required liquidity of a zone.
+ 
+    (zone, completed 5M candle) -> a Sweep, or None
+ 
+For each candle the engine asks the injected LiquidityEngine for the zone's
+required liquidity AS OF THE CANDLE'S OPEN TIME:
+ 
+    liquidity_engine.required_liquidity_for(zone, candle.open_time)
+ 
+That is the existing "newest relevant liquidity" selection, used unchanged. Only
+levels already known when the candle opened can be swept, and a level that
+becomes known later can become the required level for LATER candles.
+ 
+A sweep needs a STRICT wick penetration beyond the required level:
+DEMAND candle.low < level.price, SUPPLY candle.high > level.price. A close
+beyond the level is not required.
+ 
+One sweep per (zone, liquidity level) pair: the first penetrating candle
+creates it; later candles that penetrate the same level create nothing new. A
+different, newer required level can produce its own sweep.
+ 
+This engine only READS the LiquidityEngine; it never stores or changes
+liquidity, and no sweep state exists inside Liquidity. It contains no zone-touch
+logic, no setup, confirmation, entry, SL/TP, risk, news or execution logic, no
+BOS/CHOCH, and no tolerance, distance, ATR, displacement or session filter.
+ 
+Zones of every timeframe (1H, 15M, 5M) may be supplied; each zone is tracked
+independently by its own identity.
+ 
+Lifecycle: sweeps are append-only (acceptance order). Nothing is deleted,
+expired, invalidated or consumed here.
+ 
+Integrity checks (no strategy behaviour):
+- zone / candle / now have the right types; the candle is 5M and CLOSED at `now`;
+- the candle opens at or after `zone.created_at` (a zone cannot be swept before
+  it exists);
+- a zone identity is always the same zone (a different zone with the same
+  identity is rejected);
+- candles for one zone arrive in chronological order without overlap.
+ 
+Replay: supplying the candle that produced a stored sweep again returns that
+sweep; supplying the latest processed candle of a zone again returns the same
+result; both change nothing. Any other candle that opens before the previous
+candle of that zone closed raises ValueError. A rejected call changes nothing.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.engines.liquidity_engine import LiquidityEngine
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.liquidity import LiquidityLevel
+from koffie.strategy.models.pivot import BOSIdentity
+from koffie.strategy.models.sweep import Sweep, SweepIdentity, penetrates
+from koffie.strategy.models.zone import Zone
+ 
+ 
+class SweepEngine:
+    def __init__(self, liquidity_engine: LiquidityEngine) -> None:
+        if not isinstance(liquidity_engine, LiquidityEngine):
+            raise TypeError("liquidity_engine must be a LiquidityEngine")
+        self._liquidity = liquidity_engine
+        self._sweeps: List[Sweep] = []                                   # append-only, acceptance order
+        self._by_identity: Dict[SweepIdentity, Sweep] = {}
+        self._by_zone: Dict[BOSIdentity, List[Sweep]] = {}
+        self._zones: Dict[BOSIdentity, Zone] = {}                        # zone identity -> the zone seen
+        self._last: Dict[BOSIdentity, Tuple[Candle, Optional[Sweep]]] = {}  # latest candle + result per zone
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return Timeframe.M5
+ 
+    @property
+    def sweeps(self) -> Tuple[Sweep, ...]:
+        """Every sweep recorded, in the order they were accepted. Never removed."""
+        return tuple(self._sweeps)
+ 
+    def sweep_for(self, zone: Zone, level: LiquidityLevel) -> Optional[Sweep]:
+        """The sweep recorded for this zone and liquidity level, or None."""
+        return self._by_identity.get(SweepIdentity.from_parts(zone, level))
+ 
+    def sweeps_for_zone(self, zone: Zone) -> Tuple[Sweep, ...]:
+        """Every sweep recorded for this zone, in acceptance order."""
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        return tuple(s for s in self._by_zone.get(zone.identity, ()) if s.zone == zone)
+ 
+    def sweeps_known_at(self, moment: datetime) -> Tuple[Sweep, ...]:
+        """Sweeps whose candle had closed by `moment`, in acceptance order."""
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(s for s in self._sweeps if s.is_known_at(moment))
+ 
+    # --------------------------------------------------------------------- input
+    def process_candle(self, zone: Zone, candle: Candle, now: datetime) -> Optional[Sweep]:
+        """Evaluate one completed 5M candle against one zone.
+ 
+        Returns the new Sweep, or None when there is nothing to record (no
+        relevant liquidity known at the candle's open, the required level was
+        already swept, or the wick did not penetrate strictly beyond it).
+ 
+        Raises TypeError for wrong argument types (or mixed naive/aware
+        datetimes) and ValueError for a non-5M candle, a candle not closed at
+        `now`, a candle opening before the zone existed, a conflicting zone or
+        an out-of-order candle. Nothing is changed when an exception is raised.
+        """
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if candle.timeframe is not Timeframe.M5:
+            raise ValueError(
+                f"SweepEngine works on 5M candles only, but received a {candle.timeframe.value} candle"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only completed candles may sweep")
+        if candle.open_time < zone.created_at:
+            raise ValueError("the zone did not exist yet when this candle opened")
+ 
+        zone_id = zone.identity
+        seen_zone = self._zones.get(zone_id)
+        if seen_zone is not None and seen_zone != zone:
+            raise ValueError("a different zone with the same identity was already seen; conflicting zone rejected")
+ 
+        last = self._last.get(zone_id)
+        if last is not None:
+            last_candle, last_result = last
+            if candle == last_candle:
+                return last_result                                   # replay of the latest candle: no state change
+            if candle.open_time < last_candle.close_time:
+                for earlier in self._by_zone.get(zone_id, ()):
+                    if earlier.candle == candle:
+                        return earlier                               # replay of a sweeping candle: no state change
+                raise ValueError(
+                    "candles for a zone must arrive in chronological order without overlap "
+                    "(candle opens before the previous candle closed)"
+                )
+ 
+        result: Optional[Sweep] = None
+        level = self._liquidity.required_liquidity_for(zone, candle.open_time)
+        if level is not None:
+            identity = SweepIdentity.from_parts(zone, level)
+            if identity not in self._by_identity and penetrates(zone, level, candle):
+                result = Sweep(zone, level, candle)
+ 
+        # Commit only after validation and construction succeeded.
+        self._zones[zone_id] = zone
+        self._last[zone_id] = (candle, result)
+        if result is not None:
+            self._sweeps.append(result)
+            self._by_identity[result.identity] = result
+            self._by_zone.setdefault(zone_id, []).append(result)
+        return result
+"""SwingEngine for Koffie Strategy 1 (spec sections 4-7).
+ 
+Causal, incremental 3-candle swing detection on ONE timeframe.
+ 
+    swing high at N:  high[N] > high[N-1]  AND  high[N] > high[N+1]
+    swing low  at N:  low[N]  < low[N-1]   AND  low[N]  < low[N+1]
+ 
+Equality never qualifies. Candle N becomes a confirmed swing only when candle
+N+1 has CLOSED; the candle handed to `process_candle` is that N+1 candle.
+Every confirmed local swing is automatically a structural swing (no filter).
+ 
+The engine only detects and records swings. It does NOT determine HH/HL/LH/LL,
+BOS, CHOCH, trend, zones, liquidity, EQH/EQL, BRR, entries or SL/TP.
+ 
+Behaviour
+---------
+- Outside bar: a candle satisfying both rules emits BOTH swings, HIGH first,
+  then LOW (consecutive sequence numbers, same `confirmed_at`).
+- Input is validated before any state changes; a rejected candle leaves the
+  engine exactly as it was.
+- Candles must not overlap: a candle must open at or after the previous
+  candle's close_time. Gaps (weekends, holidays) are accepted.
+- `now` is required so the closed-candle rule cannot be skipped. A backtest
+  replaying stored candles passes `now=candle.close_time`.
+- Datetimes must be consistently naive or consistently timezone-aware; mixing
+  them raises TypeError from Python's datetime comparison (before any state
+  change).
+"""
+from __future__ import annotations
+ 
+from collections import deque
+from datetime import datetime
+from typing import Deque, List, Optional, Tuple
+ 
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.swing import Swing, SwingType
+ 
+ 
+class SwingEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+ 
+        # The last two accepted candles: (previous, candidate). The incoming
+        # candle is always the right-hand confirmation candle.
+        self._window: Deque[Candle] = deque(maxlen=2)
+ 
+        # Append-only history. A swing's `sequence` equals its index here.
+        self._history: List[Swing] = []
+ 
+        # Latest two CONFIRMED swings per type. "Active" means most recently
+        # confirmed, NOT the highest high or lowest low.
+        self._active_high: Optional[Swing] = None
+        self._prior_high: Optional[Swing] = None
+        self._active_low: Optional[Swing] = None
+        self._prior_low: Optional[Swing] = None
+ 
+    # ------------------------------------------------------------------
+    # Read-only state
+    # ------------------------------------------------------------------
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+ 
+    @property
+    def history(self) -> Tuple[Swing, ...]:
+        """All confirmed swings in confirmation order, oldest first."""
+        return tuple(self._history)
+ 
+    @property
+    def active_swing_high(self) -> Optional[Swing]:
+        return self._active_high
+ 
+    @property
+    def prior_swing_high(self) -> Optional[Swing]:
+        return self._prior_high
+ 
+    @property
+    def active_swing_low(self) -> Optional[Swing]:
+        return self._active_low
+ 
+    @property
+    def prior_swing_low(self) -> Optional[Swing]:
+        return self._prior_low
+ 
+    # ------------------------------------------------------------------
+    # Processing
+    # ------------------------------------------------------------------
+    def process_candle(self, candle: Candle, now: datetime) -> List[Swing]:
+        """Process one CLOSED candle as the confirmation candle (N+1).
+ 
+        Returns the swings newly confirmed by this candle: zero, one or two.
+ 
+        Raises:
+            TypeError:  `candle` is not a Candle or `now` is not a datetime.
+            ValueError: wrong timeframe, candle not closed at `now`, or candle
+                        not chronologically after the previous candle.
+        Nothing is changed when an exception is raised.
+        """
+        self._validate(candle, now)
+ 
+        new_swings: List[Swing] = []
+        if len(self._window) == 2:
+            previous, candidate = self._window
+            sequence = len(self._history)
+ 
+            if candidate.high > previous.high and candidate.high > candle.high:
+                new_swings.append(
+                    Swing(
+                        swing_type=SwingType.HIGH,
+                        timeframe=self._timeframe,
+                        price=candidate.high,
+                        candle_time=candidate.open_time,
+                        confirmed_at=candle.close_time,
+                        sequence=sequence,
+                    )
+                )
+                sequence += 1
+ 
+            if candidate.low < previous.low and candidate.low < candle.low:
+                new_swings.append(
+                    Swing(
+                        swing_type=SwingType.LOW,
+                        timeframe=self._timeframe,
+                        price=candidate.low,
+                        candle_time=candidate.open_time,
+                        confirmed_at=candle.close_time,
+                        sequence=sequence,
+                    )
+                )
+ 
+        # Commit only after validation and swing construction succeeded.
+        self._window.append(candle)
+        for swing in new_swings:
+            self._record(swing)
+        return list(new_swings)
+ 
+    def _validate(self, candle: Candle, now: datetime) -> None:
+        if not isinstance(candle, Candle):
+            raise TypeError("candle must be a Candle")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if candle.timeframe is not self._timeframe:
+            raise ValueError(
+                f"SwingEngine is configured for {self._timeframe.value}, "
+                f"but received a {candle.timeframe.value} candle"
+            )
+        if not candle.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be processed")
+        if self._window and candle.open_time < self._window[-1].close_time:
+            raise ValueError(
+                "candles must be supplied in chronological order without overlap "
+                "(candle opens before the previous candle closed)"
+            )
+ 
+    def _record(self, swing: Swing) -> None:
+        self._history.append(swing)  # every confirmed swing is structural
+        if swing.swing_type is SwingType.HIGH:
+            self._prior_high = self._active_high
+            self._active_high = swing
+        else:
+            self._prior_low = self._active_low
+            self._active_low = swing
+"""ZoneEngine for Koffie Strategy 1.
+ 
+Turns Pivot outcomes into supply/demand zones for ONE timeframe.
+ 
+    PivotOutcome FOUND           -> one Zone (bullish BOS = DEMAND, bearish = SUPPLY)
+    PivotOutcome NO_PIVOT_FOUND  -> no Zone; nothing is invented
+ 
+The engine receives a PivotOutcome and `now`; it never sees candles, never
+imports PivotEngine or any other engine, and adds no rule about zone size,
+freshness, strength, touches or ranking.
+ 
+Lifecycle: zones persist. Nothing here deletes, invalidates, mitigates, merges
+or ranks a zone. Zones that overlap stay separate records, each with its own
+causal chain (Zone -> Pivot -> BOS -> broken swing). Whether a zone may take
+part in a setup is decided by a later component, not here.
+ 
+Time: a zone is created when its BOS confirms (`Zone.created_at`). It must not
+be treated as existing before that, which is why `now` may not be earlier than
+the outcome's `confirmed_at`, and why `zones_known_at(moment)` only returns
+zones whose `created_at` has been reached.
+ 
+Idempotency: every outcome is keyed by its BOSIdentity. Supplying the exact same
+outcome again returns the stored result and changes nothing. The same identity
+with a different outcome raises ValueError (conflicting replay).
+ 
+Integrity checks (no strategy behaviour): the outcome is a PivotOutcome on this
+timeframe; `now` is a datetime not earlier than the outcome's confirmed_at; new
+outcomes arrive with non-decreasing confirmed_at. A rejected call changes
+nothing.
+"""
+from __future__ import annotations
+ 
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+ 
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.pivot import BOSIdentity, PivotOutcome
+from koffie.strategy.models.zone import Zone
+ 
+ 
+class ZoneEngine:
+    def __init__(self, timeframe: Timeframe) -> None:
+        if not isinstance(timeframe, Timeframe):
+            raise TypeError("timeframe must be a Timeframe")
+        self._timeframe = timeframe
+        self._zones: List[Zone] = []                       # append-only, creation order
+        self._outcomes: List[PivotOutcome] = []            # append-only, every outcome seen
+        self._by_identity: Dict[BOSIdentity, Tuple[PivotOutcome, Optional[Zone]]] = {}
+ 
+    # ------------------------------------------------------------- read-only state
+    @property
+    def timeframe(self) -> Timeframe:
+        return self._timeframe
+ 
+    @property
+    def zones(self) -> Tuple[Zone, ...]:
+        """Every zone created, oldest first. Zones are never removed."""
+        return tuple(self._zones)
+ 
+    @property
+    def outcomes(self) -> Tuple[PivotOutcome, ...]:
+        """Every accepted outcome (FOUND and NO_PIVOT_FOUND), oldest first."""
+        return tuple(self._outcomes)
+ 
+    def zone_for(self, identity: BOSIdentity) -> Optional[Zone]:
+        """The zone created for this BOS identity, or None."""
+        if not isinstance(identity, BOSIdentity):
+            raise TypeError("identity must be a BOSIdentity")
+        entry = self._by_identity.get(identity)
+        return entry[1] if entry is not None else None
+ 
+    def zones_known_at(self, moment: datetime) -> Tuple[Zone, ...]:
+        """Zones whose `created_at` has been reached at `moment`, oldest first.
+ 
+        A zone is not returned before its BOS confirmed it, even though its
+        Pivot candle (origin_time) is earlier.
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return tuple(z for z in self._zones if z.is_known_at(moment))
+ 
+    # --------------------------------------------------------------------- input
+    def process_outcome(self, outcome: PivotOutcome, now: datetime) -> Optional[Zone]:
+        """Accept one PivotOutcome; return its Zone, or None for NO_PIVOT_FOUND.
+ 
+        Raises TypeError for wrong argument types and ValueError for a wrong
+        timeframe, a `now` before the BOS confirmed, a conflicting replay or an
+        out-of-order outcome. Nothing is changed when an exception is raised.
+        """
+        if not isinstance(outcome, PivotOutcome):
+            raise TypeError("outcome must be a PivotOutcome")
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if outcome.bos.timeframe is not self._timeframe:
+            raise ValueError(
+                f"ZoneEngine is configured for {self._timeframe.value}, "
+                f"but received a {outcome.bos.timeframe.value} outcome"
+            )
+        if now < outcome.confirmed_at:
+            raise ValueError("the BOS is not confirmed yet at `now`; a zone cannot exist before created_at")
+ 
+        identity = outcome.identity
+        stored = self._by_identity.get(identity)
+        if stored is not None:
+            stored_outcome, stored_zone = stored
+            if outcome != stored_outcome:
+                raise ValueError(
+                    "this BOS identity was already recorded with a different outcome; "
+                    "conflicting replay rejected"
+                )
+            return stored_zone                                  # exact replay: no state change
+ 
+        if self._outcomes and outcome.confirmed_at < self._outcomes[-1].confirmed_at:
+            raise ValueError("outcomes must arrive in non-decreasing confirmed_at order")
+ 
+        zone = Zone(outcome.pivot) if outcome.is_found else None
+ 
+        # Commit only after validation and construction succeeded.
+        self._outcomes.append(outcome)
+        self._by_identity[identity] = (outcome, zone)
+        if zone is not None:
+            self._zones.append(zone)
+        return zone
+"""BOS (Break of Structure) model for Koffie Strategy 1 (spec section 11).
+ 
+A BOS is a CONTINUATION of the current structural direction:
+ 
+    bullish BOS: a CLOSED candle closes above the active structural swing high
+    bearish BOS: a CLOSED candle closes below the active structural swing low
+ 
+Only the candle's CLOSE counts; a wick through the level is not a BOS. This
+module is DATA ONLY: it records one BOS event and validates that the record
+is internally consistent. It contains no detection logic, no state change, no
+CHOCH, pivot, zone, liquidity or trading logic.
+"""
+from __future__ import annotations
+ 
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+ 
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.swing import Swing, SwingType
+ 
+ 
+class BOSDirection(Enum):
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+ 
+ 
+@dataclass(frozen=True)
+class BOS:
+    """Immutable record of one continuation break.
+ 
+    timeframe      timeframe the break happened on
+    direction      BULLISH (broke a swing high) or BEARISH (broke a swing low)
+    broken_swing   the active swing whose level was broken: a HIGH swing for a
+                   bullish BOS, a LOW swing for a bearish BOS
+    candle_time    open_time of the breaking candle
+    close_price    close of the breaking candle; strictly beyond the swing price
+ 
+    `confirmed_at` is derived: the breaking candle's close time, the moment
+    the BOS became knowable.
+ 
+    The broken swing must already be confirmed by then. A swing confirmed by
+    the very same candle is allowed (confirmed_at equal), because swings are
+    processed before BOS/CHOCH within a candle.
+    """
+ 
+    timeframe: Timeframe
+    direction: BOSDirection
+    broken_swing: Swing
+    candle_time: datetime
+    close_price: float
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if not isinstance(self.direction, BOSDirection):
+            raise ValueError("direction must be a BOSDirection")
+        if not isinstance(self.broken_swing, Swing):
+            raise ValueError("broken_swing must be a Swing")
+        if not isinstance(self.candle_time, datetime):
+            raise ValueError("candle_time must be a datetime")
+        if isinstance(self.close_price, bool) or not isinstance(self.close_price, (int, float)):
+            raise ValueError("close_price must be a number")
+        if not math.isfinite(self.close_price):
+            raise ValueError("close_price must be finite")
+ 
+        if self.broken_swing.timeframe is not self.timeframe:
+            raise ValueError("broken_swing belongs to a different timeframe")
+ 
+        if self.direction is BOSDirection.BULLISH:
+            if self.broken_swing.swing_type is not SwingType.HIGH:
+                raise ValueError("a bullish BOS breaks a swing HIGH")
+            if not self.close_price > self.broken_swing.price:
+                raise ValueError("a bullish BOS must close strictly above the swing high")
+        else:
+            if self.broken_swing.swing_type is not SwingType.LOW:
+                raise ValueError("a bearish BOS breaks a swing LOW")
+            if not self.close_price < self.broken_swing.price:
+                raise ValueError("a bearish BOS must close strictly below the swing low")
+ 
+        if (self.candle_time.tzinfo is None) != (self.broken_swing.confirmed_at.tzinfo is None):
+            raise ValueError(
+                "candle_time and the broken swing's times must both be naive or both timezone-aware"
+            )
+        if self.broken_swing.confirmed_at > self.confirmed_at:
+            raise ValueError("the broken swing must be confirmed by the time the BOS is confirmed")
+ 
+    @property
+    def confirmed_at(self) -> datetime:
+        """Close time of the breaking candle."""
+        return self.candle_time + self.timeframe.duration
+"""Candle model for Koffie Strategy 1 (spec sections 2, 3 and 15).
+ 
+This module defines the three timeframes, an immutable OHLCV candle, facts
+derived directly from one candle's own values, and the locked Strategy 1
+BRR candle classification. It contains no swing or structure logic.
+
+BRR classification (locked)
+---------------------------
+    BRR = abs(close - open) / (high - low)
+
+    high == low                 -> ZERO_RANGE_ANOMALY (never decisive)
+    BRR >  0.50, close > open   -> BULLISH_DECISIVE
+    BRR >  0.50, close < open   -> BEARISH_DECISIVE
+    BRR <= 0.50 (incl. exactly 0.50 and close == open) -> NEUTRAL
+
+The 0.50 default may be overridden via `classify(now, threshold=...)` for
+backtesting; the comparison stays strict. BRR alone decides; no ATR, size, wick, displacement or volatility filter.
+Only a fully CLOSED candle can be classified: `classify(now)` raises
+ValueError while `now < close_time`, so a forming candle can never be decisive.
+ 
+Timing
+------
+`open_time` is the START of the candle's period. A candle is CLOSED only once
+its full timeframe has elapsed, i.e. `now >= close_time`.
+"""
+from __future__ import annotations
+ 
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
+
+
+BRR_DECISIVE_THRESHOLD = 0.50
+
+
+class CandleClass(Enum):
+    BULLISH_DECISIVE = "BULLISH_DECISIVE"
+    BEARISH_DECISIVE = "BEARISH_DECISIVE"
+    NEUTRAL = "NEUTRAL"                        # DOJI / NEUTRAL: BRR <= 0.50
+    ZERO_RANGE_ANOMALY = "ZERO_RANGE_ANOMALY"  # high == low
+
+    @property
+    def is_decisive(self) -> bool:
+        return self in (CandleClass.BULLISH_DECISIVE, CandleClass.BEARISH_DECISIVE)
+
+
+class Timeframe(Enum):
+    M5 = "5M"
+    M15 = "15M"
+    H1 = "1H"
+ 
+    @property
+    def duration(self) -> timedelta:
+        return _DURATIONS[self]
+ 
+ 
+_DURATIONS = {
+    Timeframe.M5: timedelta(minutes=5),
+    Timeframe.M15: timedelta(minutes=15),
+    Timeframe.H1: timedelta(hours=1),
+}
+ 
+ 
+@dataclass(frozen=True)
+class Candle:
+    timeframe: Timeframe
+    open_time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if not isinstance(self.open_time, datetime):
+            raise ValueError("open_time must be a datetime")
+        prices = (self.open, self.high, self.low, self.close)
+        if not all(math.isfinite(p) for p in prices):
+            raise ValueError("open, high, low and close must be finite numbers")
+        if not (math.isfinite(self.volume) and self.volume >= 0):
+            raise ValueError("volume must be a finite number >= 0")
+        if self.high < self.low:
+            raise ValueError("high must be >= low")
+        if self.high < max(self.open, self.close):
+            raise ValueError("high must be >= open and close")
+        if self.low > min(self.open, self.close):
+            raise ValueError("low must be <= open and close")
+ 
+    # -- timing ---------------------------------------------------------
+    @property
+    def close_time(self) -> datetime:
+        """Moment the candle's complete timeframe has elapsed."""
+        return self.open_time + self.timeframe.duration
+ 
+    def is_closed_at(self, now: datetime) -> bool:
+        """True only once the complete timeframe has elapsed (now >= close_time)."""
+        return now >= self.close_time
+ 
+    # -- geometry (spec section 15) --------------------------------------
+    @property
+    def range(self) -> float:
+        return self.high - self.low
+ 
+    @property
+    def body(self) -> float:
+        return abs(self.close - self.open)
+ 
+    # -- direction (spec section 15) -------------------------------------
+    @property
+    def is_bullish(self) -> bool:
+        return self.close > self.open
+ 
+    @property
+    def is_bearish(self) -> bool:
+        return self.close < self.open
+ 
+    @property
+    def is_doji(self) -> bool:
+        """Literal close == open ONLY. This is NOT the Strategy 1 "DOJI / NEUTRAL"
+        (BRR <= 0.50); use `classify(now)` for that."""
+        return self.close == self.open
+
+    # -- BRR classification (locked Strategy 1 rule) ----------------------
+    @property
+    def brr(self) -> Optional[float]:
+        """abs(close - open) / (high - low), or None when high == low."""
+        if self.high == self.low:
+            return None
+        return abs(self.close - self.open) / (self.high - self.low)
+
+    def classify(
+        self, now: datetime, threshold: float = BRR_DECISIVE_THRESHOLD
+    ) -> CandleClass:
+        """Classify this candle. Only a fully closed candle may be classified.
+
+        Raises ValueError if the candle is not closed at `now` (TypeError if
+        `now` is not a datetime), so an unclosed candle is never decisive.
+
+        `threshold` defaults to the locked Strategy 1 value (0.50); it is
+        configurable only for future backtesting. The comparison is always
+        strict: BRR > threshold is decisive, BRR <= threshold is NEUTRAL.
+        It must be a finite number in [0, 1].
+        """
+        if not isinstance(now, datetime):
+            raise TypeError("now must be a datetime")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise TypeError("threshold must be a number")
+        if not (math.isfinite(threshold) and 0.0 <= threshold <= 1.0):
+            raise ValueError("threshold must be a finite number between 0 and 1")
+        if not self.is_closed_at(now):
+            raise ValueError("candle is not closed yet; only closed candles may be classified")
+        brr = self.brr
+        if brr is None:
+            return CandleClass.ZERO_RANGE_ANOMALY
+        if brr > threshold:
+            if self.close > self.open:
+                return CandleClass.BULLISH_DECISIVE
+            return CandleClass.BEARISH_DECISIVE   # close < open (close == open gives BRR 0)
+        return CandleClass.NEUTRAL
+"""CHOCH (Change of Character) model for Koffie Strategy 1 (spec sections 12-13).
+
+A CHOCH records that the PROTECTED swing of an established trend was broken:
+
+    BULLISH structure -> protected swing = active swing LOW
+        broken by a candle CLOSING BELOW it   -> CHOCH toward BEARISH
+    BEARISH structure -> protected swing = active swing HIGH
+        broken by a candle CLOSING ABOVE it   -> CHOCH toward BULLISH
+
+CHOCH is close-based (locked): a wick beyond the protected swing without a
+close beyond it is not a CHOCH. `break_price` is the breaking candle's close.
+
+A CHOCH is not a trade entry and does not itself declare a new trend. The
+structure moves to REVALUATING when a later component calls
+StructureEngine.enter_revaluating(); the new direction is decided by swings.
+
+This module is DATA ONLY: no detection, no state change, no BOS, pivot, zone,
+liquidity or trading logic.
+"""
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.structure import StructureState
+from koffie.strategy.models.swing import Swing, SwingType
+
+
+class CHOCHDirection(Enum):
+    """Direction of the POTENTIAL reversal the break points toward."""
+
+    BEARISH = "BEARISH"   # a bullish structure's protected low was broken
+    BULLISH = "BULLISH"   # a bearish structure's protected high was broken
+
+
+@dataclass(frozen=True)
+class CHOCH:
+    """Immutable record of one protected-swing break.
+
+    timeframe        timeframe the break happened on
+    direction        BEARISH (protected LOW broken) or BULLISH (protected HIGH broken)
+    protected_swing  the swing that was broken: LOW for BEARISH, HIGH for BULLISH
+    candle_time      open_time of the breaking candle
+    break_price      the breaking candle's CLOSE; strictly beyond the protected
+                     swing's price (below it for BEARISH, above it for BULLISH)
+
+    `confirmed_at` is derived: the breaking candle's close time. Only closed
+    candles are processed, so the break becomes knowable when the candle closes.
+
+    The protected swing must already be confirmed by then; a swing confirmed by
+    the very same candle is allowed, because swings are processed before
+    BOS/CHOCH within a candle.
+    """
+
+    timeframe: Timeframe
+    direction: CHOCHDirection
+    protected_swing: Swing
+    candle_time: datetime
+    break_price: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if not isinstance(self.direction, CHOCHDirection):
+            raise ValueError("direction must be a CHOCHDirection")
+        if not isinstance(self.protected_swing, Swing):
+            raise ValueError("protected_swing must be a Swing")
+        if not isinstance(self.candle_time, datetime):
+            raise ValueError("candle_time must be a datetime")
+        if isinstance(self.break_price, bool) or not isinstance(self.break_price, (int, float)):
+            raise ValueError("break_price must be a number")
+        if not math.isfinite(self.break_price):
+            raise ValueError("break_price must be finite")
+
+        if self.protected_swing.timeframe is not self.timeframe:
+            raise ValueError("protected_swing belongs to a different timeframe")
+
+        if self.direction is CHOCHDirection.BEARISH:
+            if self.protected_swing.swing_type is not SwingType.LOW:
+                raise ValueError("a bearish CHOCH breaks a protected swing LOW")
+            if not self.break_price < self.protected_swing.price:
+                raise ValueError("a bearish CHOCH must close strictly below the protected low")
+        else:
+            if self.protected_swing.swing_type is not SwingType.HIGH:
+                raise ValueError("a bullish CHOCH breaks a protected swing HIGH")
+            if not self.break_price > self.protected_swing.price:
+                raise ValueError("a bullish CHOCH must close strictly above the protected high")
+
+        if (self.candle_time.tzinfo is None) != (self.protected_swing.confirmed_at.tzinfo is None):
+            raise ValueError(
+                "candle_time and the protected swing's times must both be naive or both timezone-aware"
+            )
+        if self.protected_swing.confirmed_at > self.confirmed_at:
+            raise ValueError(
+                "the protected swing must be confirmed by the time the CHOCH is confirmed"
+            )
+
+    @property
+    def confirmed_at(self) -> datetime:
+        """Close time of the breaking candle."""
+        return self.candle_time + self.timeframe.duration
+
+    @property
+    def prior_state(self) -> StructureState:
+        """The trend that existed before the break (BULLISH for a bearish CHOCH)."""
+        if self.direction is CHOCHDirection.BEARISH:
+            return StructureState.BULLISH
+        return StructureState.BEARISH
+"""Confirmation model for Koffie Strategy 1.
+ 
+After a Sweep, the 5M price action must CONFIRM it. Confirmation is evaluated on
+completed 5M candles, whatever timeframe the sweeping zone came from, using the
+existing Candle classifier (BRR > 0.70 = decisive). This module is DATA ONLY; the
+sequence itself is run by ConfirmationEngine.
+ 
+The locked sequence, LONG (demand zone); SHORT (supply zone) is the mirror:
+ 
+    BULLISH_DECISIVE                          -> CONFIRMED
+    BEARISH_DECISIVE, close >= zone.low       -> wait for the next decisive candle
+    BEARISH_DECISIVE, close <  zone.low       -> INVALIDATED (boundary)
+    next decisive: BULLISH_DECISIVE           -> CONFIRMED
+    next decisive: BEARISH_DECISIVE           -> INVALIDATED
+    NEUTRAL / ZERO_RANGE_ANOMALY              -> keep waiting (never consume the sequence)
+ 
+    SHORT: BEARISH_DECISIVE confirms, BULLISH_DECISIVE is the wrong direction and the
+    boundary is `close > zone.high`.
+ 
+A wick beyond the zone boundary never invalidates; only a CLOSE beyond it does. A
+confirming candle may close outside the zone. The sweep candle itself may confirm.
+ 
+Records (all immutable)
+-----------------------
+ConfirmationStatus   the per-Sweep state held by the engine
+Confirmation         the CONFIRMED event: exactly two stored fields, `sweep` and `candle`
+Invalidation         the INVALIDATED event: `sweep`, `candle` and an explanatory `reason`
+InvalidationReason   CLOSED_BEYOND_ZONE_BOUNDARY or SECOND_WRONG_DIRECTION_DECISIVE
+ 
+Nothing is duplicated: the zone, its boundaries, the liquidity, the swept price and the
+direction (`zone_type`: DEMAND = LONG, SUPPLY = SHORT) are all read from the Sweep; the
+candle's class is derived from the Candle.
+ 
+The invalidation `reason` is an audit label only; it never changes a transition. When a
+candle satisfies both reasons, CLOSED_BEYOND_ZONE_BOUNDARY is the label.
+ 
+This module contains no setup, entry, SL/TP, risk, news or execution logic, no BOS/CHOCH,
+no tolerance, distance, ATR, displacement or session rule, no timeout and no flag.
+"""
+from __future__ import annotations
+ 
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+ 
+from koffie.strategy.models.candle import Candle, CandleClass, Timeframe
+from koffie.strategy.models.sweep import Sweep, SweepIdentity
+from koffie.strategy.models.zone import Zone, ZoneType
+ 
+# The decisive class that confirms, and the one that is the wrong direction, by zone type.
+CONFIRMING_CLASS_FOR = {
+    ZoneType.DEMAND: CandleClass.BULLISH_DECISIVE,
+    ZoneType.SUPPLY: CandleClass.BEARISH_DECISIVE,
+}
+WRONG_CLASS_FOR = {
+    ZoneType.DEMAND: CandleClass.BEARISH_DECISIVE,
+    ZoneType.SUPPLY: CandleClass.BULLISH_DECISIVE,
+}
+ 
+ 
+class ConfirmationStatus(Enum):
+    WAITING_FOR_DECISIVE = "WAITING_FOR_DECISIVE"
+    WAITING_FOR_SECOND_DECISIVE = "WAITING_FOR_SECOND_DECISIVE"
+    CONFIRMED = "CONFIRMED"            # terminal
+    INVALIDATED = "INVALIDATED"        # terminal
+ 
+ 
+class InvalidationReason(Enum):
+    CLOSED_BEYOND_ZONE_BOUNDARY = "CLOSED_BEYOND_ZONE_BOUNDARY"
+    SECOND_WRONG_DIRECTION_DECISIVE = "SECOND_WRONG_DIRECTION_DECISIVE"
+ 
+ 
+def closes_beyond_boundary(zone_type: ZoneType, zone: Zone, candle: Candle) -> bool:
+    """True when the candle CLOSES strictly beyond the zone boundary on the invalidating side.
+ 
+    DEMAND: candle.close < zone.low.   SUPPLY: candle.close > zone.high.
+    A wick beyond the boundary does not count, and a close exactly on it is not beyond it.
+    Pure check: it does not look at the candle's class, times or timeframe.
+    """
+    if not isinstance(zone_type, ZoneType):
+        raise TypeError("zone_type must be a ZoneType")
+    if not isinstance(zone, Zone):
+        raise TypeError("zone must be a Zone")
+    if not isinstance(candle, Candle):
+        raise TypeError("candle must be a Candle")
+    if zone_type is ZoneType.DEMAND:
+        return candle.close < zone.low
+    return candle.close > zone.high
+ 
+ 
+def _check_sweep_and_candle(sweep: object, candle: object) -> None:
+    if not isinstance(sweep, Sweep):
+        raise ValueError("sweep must be a Sweep")
+    if not isinstance(candle, Candle):
+        raise ValueError("candle must be a Candle")
+    if candle.timeframe is not Timeframe.M5:
+        raise ValueError("confirmation uses completed 5M candles")
+    if candle.open_time < sweep.candle.open_time:
+        raise ValueError("the candle is earlier than the sweep candle")
+ 
+ 
+@dataclass(frozen=True)
+class Confirmation:
+    """Immutable record: this completed 5M candle CONFIRMED this Sweep."""
+ 
+    sweep: Sweep
+    candle: Candle
+ 
+    def __post_init__(self) -> None:
+        _check_sweep_and_candle(self.sweep, self.candle)
+        wanted = CONFIRMING_CLASS_FOR[self.sweep.zone_type]
+        if self.candle_class is not wanted:
+            raise ValueError(f"a {self.sweep.zone_type.value} sweep is confirmed by a {wanted.value} candle")
+ 
+    # -- derived values -------------------------------------------------------------
+    @property
+    def zone(self) -> Zone:
+        return self.sweep.zone
+ 
+    @property
+    def zone_type(self) -> ZoneType:
+        """The direction: DEMAND = LONG, SUPPLY = SHORT."""
+        return self.sweep.zone_type
+ 
+    @property
+    def candle_class(self) -> CandleClass:
+        """The confirming candle's class, from the existing classifier (it is closed at its own close time)."""
+        return self.candle.classify(self.candle.close_time)
+ 
+    @property
+    def candle_time(self) -> datetime:
+        """Open time of the confirming candle."""
+        return self.candle.open_time
+ 
+    @property
+    def known_at(self) -> datetime:
+        """Confirmation is known only once its candle has CLOSED."""
+        return self.candle.close_time
+ 
+    def is_known_at(self, moment: datetime) -> bool:
+        """True only from `known_at` onward.
+ 
+        Raises TypeError if `moment` is not a datetime (and, as for any datetime
+        comparison, if it mixes naive and timezone-aware values).
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+ 
+    @property
+    def identity(self) -> SweepIdentity:
+        """At most one Confirmation exists per Sweep, so its identity is the Sweep's."""
+        return self.sweep.identity
+ 
+ 
+@dataclass(frozen=True)
+class Invalidation:
+    """Immutable record: this completed 5M candle permanently INVALIDATED this Sweep's confirmation."""
+ 
+    sweep: Sweep
+    candle: Candle
+    reason: InvalidationReason
+ 
+    def __post_init__(self) -> None:
+        _check_sweep_and_candle(self.sweep, self.candle)
+        if not isinstance(self.reason, InvalidationReason):
+            raise ValueError("reason must be an InvalidationReason")
+        wrong = WRONG_CLASS_FOR[self.sweep.zone_type]
+        if self.candle_class is not wrong:
+            raise ValueError(f"a {self.sweep.zone_type.value} sweep is invalidated by a {wrong.value} candle")
+        beyond = closes_beyond_boundary(self.sweep.zone_type, self.sweep.zone, self.candle)
+        if beyond and self.reason is not InvalidationReason.CLOSED_BEYOND_ZONE_BOUNDARY:
+            raise ValueError("a candle that closes beyond the zone boundary is labelled CLOSED_BEYOND_ZONE_BOUNDARY")
+        if not beyond and self.reason is InvalidationReason.CLOSED_BEYOND_ZONE_BOUNDARY:
+            raise ValueError("the candle does not close beyond the zone boundary")
+ 
+    # -- derived values -------------------------------------------------------------
+    @property
+    def zone(self) -> Zone:
+        return self.sweep.zone
+ 
+    @property
+    def zone_type(self) -> ZoneType:
+        return self.sweep.zone_type
+ 
+    @property
+    def candle_class(self) -> CandleClass:
+        return self.candle.classify(self.candle.close_time)
+ 
+    @property
+    def candle_time(self) -> datetime:
+        return self.candle.open_time
+ 
+    @property
+    def known_at(self) -> datetime:
+        """The invalidation is known only once its candle has CLOSED."""
+        return self.candle.close_time
+ 
+    def is_known_at(self, moment: datetime) -> bool:
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+ 
+    @property
+    def identity(self) -> SweepIdentity:
+        return self.sweep.identity
+"""Entry model for Koffie Strategy 1.
+
+An Entry is the strategy-level trade entry event produced from a confirmed
+Setup and its causal Confirmation.
+
+Locked rule
+-----------
+Entry price is exactly the CLOSE of the qualifying completed M5 confirmation
+candle.
+
+No spread adjustment, offset, buffer, ATR adjustment, slippage, SL/TP, risk,
+position sizing, or execution logic belongs in this model.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+from koffie.strategy.models.confirmation import Confirmation
+from koffie.strategy.models.setup import Setup
+from koffie.strategy.models.zone import ZoneType
+
+
+class EntryDirection(Enum):
+    """Direction of the strategy-level Entry."""
+
+    LONG = "LONG"
+    SHORT = "SHORT"
+
+
+@dataclass(frozen=True)
+class Entry:
+    """Immutable strategy-level entry event."""
+
+    setup: Setup
+    confirmation: Confirmation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.setup, Setup):
+            raise TypeError("setup must be a Setup")
+
+        if not isinstance(self.confirmation, Confirmation):
+            raise TypeError("confirmation must be a Confirmation")
+
+        if self.confirmation.sweep.zone != self.setup.zone:
+            raise ValueError(
+                "confirmation must belong to the setup's zone"
+            )
+
+        if self.confirmation.known_at < self.setup.known_at:
+            raise ValueError(
+                "confirmation cannot be known before the setup exists"
+            )
+
+    @property
+    def price(self) -> float:
+        """Exact close price of the confirmation candle."""
+        return self.confirmation.candle.close
+
+    @property
+    def candle(self):
+        """The qualifying completed M5 confirmation candle."""
+        return self.confirmation.candle
+
+    @property
+    def direction(self) -> EntryDirection:
+        """DEMAND produces LONG; SUPPLY produces SHORT."""
+        if self.setup.zone_type is ZoneType.DEMAND:
+            return EntryDirection.LONG
+        if self.setup.zone_type is ZoneType.SUPPLY:
+            return EntryDirection.SHORT
+
+        raise ValueError(
+            f"unsupported zone type for Entry: {self.setup.zone_type!r}"
+        )
+
+    @property
+    def entry_time(self) -> datetime:
+        """The confirmation candle close time."""
+        return self.confirmation.candle.close_time
+
+    @property
+    def known_at(self) -> datetime:
+        """The time at which the Entry became causally knowable."""
+        return self.confirmation.known_at
+
+    @property
+    def time(self) -> datetime:
+        """Compatibility alias for the Entry time."""
+        return self.entry_time
+
+    @property
+    def zone(self):
+        """The originating Setup zone."""
+        return self.setup.zone
+
+    @property
+    def zone_type(self):
+        """The originating Setup zone type."""
+        return self.setup.zone_type
+
+    @property
+    def identity(self):
+        """Identity derived from the causal Setup and Confirmation."""
+        return self.setup.identity, self.confirmation.identity
+"""Liquidity model for Koffie Strategy 1.
+ 
+A LiquidityLevel is a confirmed swing that can act as a liquidity reference:
+ 
+    swing LOW   -> liquidity BELOW price
+    swing HIGH  -> liquidity ABOVE price
+ 
+Single source of truth
+----------------------
+A LiquidityLevel stores exactly ONE field: the confirmed `Swing`. Everything
+else is derived from it, so nothing can drift out of sync:
+ 
+    LiquidityLevel -> Swing
+ 
+Two different times (do not confuse them)
+-----------------------------------------
+origin_time   open_time of the swing candle the price comes from.
+known_at      when the swing was confirmed (the close of its right-hand
+              candle). This is the first moment the level is known. Downstream
+              logic must NOT use the level before `known_at`.
+              `is_known_at(moment)` states this rule in one place.
+ 
+Relevance to a zone (`is_relevant_to`)
+--------------------------------------
+    DEMAND zone: a swing LOW strictly BELOW the zone's low
+    SUPPLY zone: a swing HIGH strictly ABOVE the zone's high
+ 
+Strict means a price exactly equal to the zone boundary is NOT relevant.
+There is no distance limit, no tolerance (exact price equality only), no time
+cutoff and no dependence on the zone's timeframe: a 5M level can serve a 1H,
+15M or 5M zone. Two swings at the same price are simply two separate levels;
+there is no clustering and no EQH/EQL object.
+ 
+This module is DATA ONLY. It contains no detection, sweep, touch, expiry,
+ranking, consumption, setup, entry, SL/TP, risk, news or execution logic, and
+no flag of any kind. Whether a level has been swept belongs to a later
+component.
+"""
+from __future__ import annotations
+ 
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+ 
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.swing import Swing, SwingType
+from koffie.strategy.models.zone import Zone, ZoneType
+ 
+ 
+class LiquiditySide(Enum):
+    BELOW = "BELOW"   # a swing LOW: liquidity below price
+    ABOVE = "ABOVE"   # a swing HIGH: liquidity above price
+ 
+ 
+_SIDE_FOR_SWING_TYPE = {
+    SwingType.LOW: LiquiditySide.BELOW,
+    SwingType.HIGH: LiquiditySide.ABOVE,
+}
+ 
+ 
+@dataclass(frozen=True)
+class LiquidityIdentity:
+    """Immutable identity of one liquidity level, derived from its swing's fields.
+ 
+    Never derived from Python object identity, so an equal swing rebuilt from
+    the same data has the same identity. The swing's price and confirmed_at are
+    deliberately NOT part of the identity: a record with the same identity but
+    different values is a conflicting record, not a new level.
+    """
+ 
+    timeframe: Timeframe
+    swing_type: SwingType
+    swing_sequence: int
+    swing_candle_time: datetime
+ 
+    @classmethod
+    def from_swing(cls, swing: Swing) -> "LiquidityIdentity":
+        if not isinstance(swing, Swing):
+            raise TypeError("swing must be a Swing")
+        return cls(
+            timeframe=swing.timeframe,
+            swing_type=swing.swing_type,
+            swing_sequence=swing.sequence,
+            swing_candle_time=swing.candle_time,
+        )
+ 
+ 
+@dataclass(frozen=True)
+class LiquidityLevel:
+    """Immutable liquidity level, derived entirely from its confirmed Swing."""
+ 
+    swing: Swing
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.swing, Swing):
+            raise ValueError("swing must be a Swing")
+ 
+    # -- what and where -----------------------------------------------------------
+    @property
+    def side(self) -> LiquiditySide:
+        return _SIDE_FOR_SWING_TYPE[self.swing.swing_type]
+ 
+    @property
+    def price(self) -> float:
+        return self.swing.price
+ 
+    @property
+    def timeframe(self) -> Timeframe:
+        return self.swing.timeframe
+ 
+    @property
+    def sequence(self) -> int:
+        return self.swing.sequence
+ 
+    @property
+    def identity(self) -> LiquidityIdentity:
+        return LiquidityIdentity.from_swing(self.swing)
+ 
+    # -- the two times ------------------------------------------------------------
+    @property
+    def origin_time(self) -> datetime:
+        """Open time of the swing candle the price comes from."""
+        return self.swing.candle_time
+ 
+    @property
+    def known_at(self) -> datetime:
+        """When the swing was confirmed: the level is not known before this."""
+        return self.swing.confirmed_at
+ 
+    def is_known_at(self, moment: datetime) -> bool:
+        """True only from `known_at` onward.
+ 
+        Raises TypeError if `moment` is not a datetime (and, as for any datetime
+        comparison, if it mixes naive and timezone-aware values).
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+ 
+    # -- relevance to a zone --------------------------------------------------------
+    def is_relevant_to(self, zone: Zone) -> bool:
+        """Pure check, stores nothing.
+ 
+        DEMAND: a swing LOW strictly below the zone low.
+        SUPPLY: a swing HIGH strictly above the zone high.
+        """
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if zone.zone_type is ZoneType.DEMAND:
+            return self.swing.swing_type is SwingType.LOW and self.swing.price < zone.low
+        return self.swing.swing_type is SwingType.HIGH and self.swing.price > zone.high
+"""Pivot models for Koffie Strategy 1.
+ 
+A Pivot is the candle associated with a confirmed BOS:
+ 
+    bullish BOS -> the MOST RECENT completed BEARISH_DECISIVE candle before the BOS candle
+    bearish BOS -> the MOST RECENT completed BULLISH_DECISIVE candle before the BOS candle
+ 
+The Pivot keeps the candle's ENTIRE range (full wick-to-wick high and low), not
+its body. There is no size, ATR, distance or lookback rule: the only criteria
+are recency and the existing BRR classification.
+ 
+This module is DATA ONLY: frozen records that validate themselves. It contains
+no search logic (see PivotEngine) and no BOS, CHOCH, swing, structure, zone,
+liquidity, risk or trading logic.
+ 
+`NO_PIVOT_FOUND` is an explicit outcome, not an error: the BOS stays valid.
+"""
+from __future__ import annotations
+ 
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
+ 
+from koffie.strategy.models.bos import BOS, BOSDirection
+from koffie.strategy.models.candle import CandleClass, Timeframe
+from koffie.strategy.models.swing import SwingType
+ 
+ 
+# The opposite-colour decisive class each BOS direction searches for.
+PIVOT_CANDLE_CLASS = {
+    BOSDirection.BULLISH: CandleClass.BEARISH_DECISIVE,
+    BOSDirection.BEARISH: CandleClass.BULLISH_DECISIVE,
+}
+ 
+ 
+class PivotStatus(Enum):
+    FOUND = "FOUND"
+    NO_PIVOT_FOUND = "NO_PIVOT_FOUND"
+ 
+ 
+@dataclass(frozen=True)
+class BOSIdentity:
+    """Immutable identity of one BOS event, derived from the BOS's own fields.
+ 
+    Two BOS records describe the same event when these fields are equal. It is
+    never derived from Python object identity, so an equal BOS rebuilt from the
+    same data has the same identity. The swing's price and the BOS close price
+    are deliberately NOT part of the identity: a record with the same identity
+    but different values is a conflicting record, not a new event.
+    """
+ 
+    timeframe: Timeframe
+    direction: BOSDirection
+    broken_swing_type: SwingType
+    broken_swing_sequence: int
+    broken_swing_candle_time: datetime
+    candle_time: datetime
+ 
+    @classmethod
+    def from_bos(cls, bos: BOS) -> "BOSIdentity":
+        if not isinstance(bos, BOS):
+            raise TypeError("bos must be a BOS")
+        swing = bos.broken_swing
+        return cls(
+            timeframe=bos.timeframe,
+            direction=bos.direction,
+            broken_swing_type=swing.swing_type,
+            broken_swing_sequence=swing.sequence,
+            broken_swing_candle_time=swing.candle_time,
+            candle_time=bos.candle_time,
+        )
+ 
+ 
+@dataclass(frozen=True)
+class Pivot:
+    """Immutable record of the Pivot candle chosen for one BOS.
+ 
+    bos           the BOS this Pivot belongs to
+    candle_time   open_time of the Pivot candle (strictly before the BOS candle)
+    high          the Pivot candle's HIGH (full wick-to-wick range)
+    low           the Pivot candle's LOW
+    candle_class  the Pivot candle's classification: BEARISH_DECISIVE for a
+                  bullish BOS, BULLISH_DECISIVE for a bearish BOS
+ 
+    `direction`, `timeframe` and `confirmed_at` are derived from the BOS;
+    `confirmed_at` is always `bos.confirmed_at`, because the Pivot is known at
+    the moment the BOS is confirmed.
+    """
+ 
+    bos: BOS
+    candle_time: datetime
+    high: float
+    low: float
+    candle_class: CandleClass
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.bos, BOS):
+            raise ValueError("bos must be a BOS")
+        if not isinstance(self.candle_time, datetime):
+            raise ValueError("candle_time must be a datetime")
+        for name in ("high", "low"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError(name + " must be a number")
+            if not math.isfinite(value):
+                raise ValueError(name + " must be finite")
+        if self.high < self.low:
+            raise ValueError("high must be >= low")
+        if not isinstance(self.candle_class, CandleClass):
+            raise ValueError("candle_class must be a CandleClass")
+        if self.candle_class is not PIVOT_CANDLE_CLASS[self.bos.direction]:
+            raise ValueError(
+                "a " + self.bos.direction.value.lower() + " BOS requires a "
+                + PIVOT_CANDLE_CLASS[self.bos.direction].value + " Pivot candle"
+            )
+        if (self.candle_time.tzinfo is None) != (self.bos.candle_time.tzinfo is None):
+            raise ValueError("candle_time and the BOS times must both be naive or both timezone-aware")
+        if not self.candle_time < self.bos.candle_time:
+            raise ValueError("the Pivot candle must be strictly earlier than the BOS candle")
+ 
+    @property
+    def direction(self) -> BOSDirection:
+        return self.bos.direction
+ 
+    @property
+    def timeframe(self) -> Timeframe:
+        return self.bos.timeframe
+ 
+    @property
+    def candle_close_time(self) -> datetime:
+        """When the Pivot candle itself finished closing."""
+        return self.candle_time + self.bos.timeframe.duration
+ 
+    @property
+    def confirmed_at(self) -> datetime:
+        return self.bos.confirmed_at
+ 
+ 
+@dataclass(frozen=True)
+class PivotOutcome:
+    """The explicit result of Pivot selection for one BOS.
+ 
+    FOUND          `pivot` is required and must belong to the same BOS
+    NO_PIVOT_FOUND `pivot` must be None; the BOS remains valid
+    """
+ 
+    bos: BOS
+    status: PivotStatus
+    pivot: Optional[Pivot] = None
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.bos, BOS):
+            raise ValueError("bos must be a BOS")
+        if not isinstance(self.status, PivotStatus):
+            raise ValueError("status must be a PivotStatus")
+        if self.status is PivotStatus.FOUND:
+            if not isinstance(self.pivot, Pivot):
+                raise ValueError("a FOUND outcome requires a Pivot")
+            if self.pivot.bos != self.bos:
+                raise ValueError("the Pivot belongs to a different BOS")
+        else:
+            if self.pivot is not None:
+                raise ValueError("a NO_PIVOT_FOUND outcome must not carry a Pivot")
+ 
+    @property
+    def is_found(self) -> bool:
+        return self.status is PivotStatus.FOUND
+ 
+    @property
+    def identity(self) -> BOSIdentity:
+        return BOSIdentity.from_bos(self.bos)
+ 
+    @property
+    def confirmed_at(self) -> datetime:
+        return self.bos.confirmed_at
+"""Setup model for Koffie Strategy 1.
+ 
+A Setup is ONE independent trading opportunity on a Zone. It begins with the
+first qualifying Zone Touch and then follows the existing Sweep and Confirmation
+components:
+ 
+    NO_SETUP -> ZONE_TOUCHED -> WAITING_FOR_SWEEP -> SWEPT
+             -> WAITING_FOR_CONFIRMATION -> CONFIRMED -> TRADE_CREATED
+    INVALIDATED is terminal.
+ 
+Zone Touch (locked)
+-------------------
+A completed 5M candle touches a zone when its CLOSE is inside the zone, both
+boundaries inclusive:
+ 
+    zone.low <= candle.close <= zone.high
+ 
+A wick into the zone with the close outside is NOT a touch. The candle's open is
+irrelevant. The zone must already exist when the candle opens
+(`candle.open_time >= zone.created_at`).
+ 
+Single source of truth
+----------------------
+A Setup stores exactly TWO fields: the `Zone` and the qualifying touch `Candle`.
+Everything else is derived. Sweep, Confirmation and Invalidation are NOT stored
+here and no price is copied: they are owned by their own components and are read
+through the SetupEngine. The mutable lifecycle status also lives in the engine
+(as in ConfirmationEngine), so this record is immutable.
+ 
+Identity
+--------
+A Setup is identified by its Zone and its touch event (`SetupIdentity`): the
+zone's BOS identity plus the open time of the touch candle. The zone alone is NOT
+an identity, because one persistent zone can have several independent Setups over
+time.
+ 
+This module is DATA ONLY (plus two pure helpers). It contains no sweep,
+confirmation, entry, SL/TP, risk, news or execution logic, no BOS/CHOCH, no
+timeout and no filter of any kind.
+"""
+from __future__ import annotations
+ 
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Iterable, Tuple
+ 
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.liquidity import LiquidityIdentity
+from koffie.strategy.models.pivot import BOSIdentity
+from koffie.strategy.models.zone import Zone, ZoneType
+ 
+ 
+class SetupStatus(Enum):
+    """The locked Setup lifecycle. Each member keeps its own distinct meaning."""
+ 
+    NO_SETUP = "NO_SETUP"                                    # no Setup exists (never held by a Setup record)
+    ZONE_TOUCHED = "ZONE_TOUCHED"
+    WAITING_FOR_SWEEP = "WAITING_FOR_SWEEP"
+    SWEPT = "SWEPT"
+    WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
+    CONFIRMED = "CONFIRMED"
+    TRADE_CREATED = "TRADE_CREATED"
+    INVALIDATED = "INVALIDATED"                              # terminal, never revives
+ 
+    @property
+    def is_active(self) -> bool:
+        """The Sweep/Confirmation sequence of this Setup is still running."""
+        return self in (
+            SetupStatus.ZONE_TOUCHED,
+            SetupStatus.WAITING_FOR_SWEEP,
+            SetupStatus.SWEPT,
+            SetupStatus.WAITING_FOR_CONFIRMATION,
+        )
+ 
+    @property
+    def is_resolved(self) -> bool:
+        """The Sweep/Confirmation sequence is over (CONFIRMED, TRADE_CREATED or INVALIDATED)."""
+        return self in (SetupStatus.CONFIRMED, SetupStatus.TRADE_CREATED, SetupStatus.INVALIDATED)
+ 
+ 
+def is_touch(zone: Zone, candle: Candle) -> bool:
+    """True when the candle CLOSES inside the zone, both boundaries inclusive.
+ 
+    Pure check: it does not look at the open, the wicks, times, timeframes or
+    whether the zone is known yet.
+    """
+    if not isinstance(zone, Zone):
+        raise TypeError("zone must be a Zone")
+    if not isinstance(candle, Candle):
+        raise TypeError("candle must be a Candle")
+    return zone.low <= candle.close <= zone.high
+ 
+ 
+@dataclass(frozen=True)
+class SetupIdentity:
+    """Identity of one Setup: its Zone's BOS identity plus the open time of its touch candle."""
+ 
+    zone_identity: BOSIdentity
+    touch_time: datetime
+ 
+    @classmethod
+    def from_parts(cls, zone: Zone, touch_candle: Candle) -> "SetupIdentity":
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(touch_candle, Candle):
+            raise TypeError("touch_candle must be a Candle")
+        return cls(zone_identity=zone.identity, touch_time=touch_candle.open_time)
+ 
+ 
+@dataclass(frozen=True)
+class Setup:
+    """Immutable record of one independent Setup: a Zone and the candle that touched it."""
+ 
+    zone: Zone
+    touch_candle: Candle
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.zone, Zone):
+            raise ValueError("zone must be a Zone")
+        if not isinstance(self.touch_candle, Candle):
+            raise ValueError("touch_candle must be a Candle")
+        if self.touch_candle.timeframe is not Timeframe.M5:
+            raise ValueError("a zone touch is made by a completed 5M candle")
+        if self.touch_candle.open_time < self.zone.created_at:
+            raise ValueError("the zone was not known yet when the touch candle opened")
+        if not is_touch(self.zone, self.touch_candle):
+            raise ValueError("the touch candle does not close inside the zone")
+ 
+    # -- derived values -------------------------------------------------------------
+    @property
+    def zone_type(self) -> ZoneType:
+        """The direction: DEMAND = LONG, SUPPLY = SHORT."""
+        return self.zone.zone_type
+ 
+    @property
+    def touch_time(self) -> datetime:
+        """Open time of the touch candle."""
+        return self.touch_candle.open_time
+ 
+    @property
+    def known_at(self) -> datetime:
+        """The Setup exists only once its touch candle has CLOSED."""
+        return self.touch_candle.close_time
+ 
+    def is_known_at(self, moment: datetime) -> bool:
+        """True only from `known_at` onward.
+ 
+        Raises TypeError if `moment` is not a datetime (and, as for any datetime
+        comparison, if it mixes naive and timezone-aware values).
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+ 
+    @property
+    def identity(self) -> SetupIdentity:
+        return SetupIdentity.from_parts(self.zone, self.touch_candle)
+ 
+ 
+@dataclass(frozen=True)
+class SetupTransition:
+    """One step of a Setup's lifecycle and the moment it became known."""
+ 
+    status: SetupStatus
+    at: datetime
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, SetupStatus):
+            raise ValueError("status must be a SetupStatus")
+        if self.status is SetupStatus.NO_SETUP:
+            raise ValueError("NO_SETUP is the absence of a Setup and cannot be a transition")
+        if not isinstance(self.at, datetime):
+            raise ValueError("at must be a datetime")
+ 
+ 
+@dataclass(frozen=True)
+class ConfirmationEventKey:
+    """The causal Sweep + Confirmation event a confirmed Setup came from.
+ 
+    Two confirmed Setups share an event when the same confirming candle confirmed a
+    Sweep of the same liquidity level. One such event may produce at most ONE trade.
+    """
+ 
+    candle_time: datetime
+    liquidity_identity: LiquidityIdentity
+ 
+ 
+# Deterministic tie-break order for overlapping zones: 1H, then 15M, then 5M.
+TIE_BREAK_RANK = {Timeframe.H1: 0, Timeframe.M15: 1, Timeframe.M5: 2}
+ 
+ 
+def tie_break_order(setups: Iterable[Setup]) -> Tuple[Setup, ...]:
+    """Order Setups 1H -> 15M -> 5M (stable for equal timeframes).
+ 
+    This is ONLY a deterministic tie-breaker for Setups that genuinely share the
+    same liquidity and confirmation event with no causal distinction. It never
+    decides which zone is causal and never prefers a zone merely for being higher.
+    """
+    items = tuple(setups)
+    for item in items:
+        if not isinstance(item, Setup):
+            raise TypeError("every item must be a Setup")
+    return tuple(sorted(items, key=lambda s: TIE_BREAK_RANK[s.zone.timeframe]))
+"""SL/TP model for Koffie Strategy 1.
+
+An SLTP is the strategy-level stop-loss / take-profit pair produced from a
+single Entry.
+
+Locked rules
+------------
+BUY / DEMAND (Entry.direction is LONG):
+    SL = exact LOW of the sweep candle:  entry.confirmation.sweep.candle.low
+    R  = entry.price - SL
+    TP = entry.price + 2 * R
+
+SELL / SUPPLY (Entry.direction is SHORT):
+    SL = exact HIGH of the sweep candle: entry.confirmation.sweep.candle.high
+    R  = SL - entry.price
+    TP = entry.price - 2 * R
+
+No buffer, no offset, no ATR, no spread, no sweep-range fraction, no
+opposite-zone target, no target-zone search, no fallback. TP is always 1:2.
+
+The Entry price is exactly the close of the confirmation candle (Entry.price).
+
+Geometry is validated: if the SL would be on the wrong side of the Entry
+(BUY: SL >= entry.price; SELL: SL <= entry.price), the SLTP is rejected
+rather than silently corrected.
+
+This module is DATA ONLY. It contains no risk, position-sizing, execution,
+MT5, news, spread, or broker logic.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+from koffie.strategy.models.entry import Entry, EntryDirection
+
+
+@dataclass(frozen=True)
+class SLTP:
+    """Immutable stop-loss / take-profit pair derived entirely from one Entry."""
+
+    entry: Entry
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entry, Entry):
+            raise TypeError("entry must be an Entry")
+        if self.direction is EntryDirection.LONG:
+            if not self.entry.price > self.stop_loss:
+                raise ValueError(
+                    "invalid geometry: BUY stop loss must be strictly below the entry price"
+                )
+        else:
+            if not self.entry.price < self.stop_loss:
+                raise ValueError(
+                    "invalid geometry: SELL stop loss must be strictly above the entry price"
+                )
+
+    # -- derivation ----------------------------------------------------------
+    @property
+    def direction(self) -> EntryDirection:
+        """LONG for a DEMAND zone, SHORT for a SUPPLY zone."""
+        return self.entry.direction
+
+    @property
+    def entry_price(self) -> float:
+        """Exact close of the confirmation candle."""
+        return self.entry.price
+
+    @property
+    def sweep_candle(self):
+        """The actual candle stored on the Sweep that the confirmation confirmed."""
+        return self.entry.confirmation.sweep.candle
+
+    @property
+    def stop_loss(self) -> float:
+        """BUY: sweep candle low. SELL: sweep candle high."""
+        if self.direction is EntryDirection.LONG:
+            return self.sweep_candle.low
+        return self.sweep_candle.high
+
+    @property
+    def risk(self) -> float:
+        """Absolute distance from entry to stop loss (always > 0 by construction)."""
+        if self.direction is EntryDirection.LONG:
+            return self.entry_price - self.stop_loss
+        return self.stop_loss - self.entry_price
+
+    @property
+    def take_profit(self) -> float:
+        """Entry shifted by exactly 2R in the trade direction."""
+        if self.direction is EntryDirection.LONG:
+            return self.entry_price + 2.0 * self.risk
+        return self.entry_price - 2.0 * self.risk
+
+    @property
+    def reward(self) -> float:
+        """Absolute distance from entry to take profit (always 2R)."""
+        if self.direction is EntryDirection.LONG:
+            return self.take_profit - self.entry_price
+        return self.entry_price - self.take_profit
+
+    @property
+    def rr_ratio(self) -> float:
+        """Reward divided by risk. Always exactly 2.0 by construction."""
+        return self.reward / self.risk
+
+    # -- timing / identity ---------------------------------------------------
+    @property
+    def known_at(self) -> datetime:
+        """The SLTP is known exactly when its Entry is known."""
+        return self.entry.known_at
+
+    def is_known_at(self, moment: datetime) -> bool:
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+
+    @property
+    def identity(self):
+        """Identity of the SLTP is the identity of its Entry (at most one SLTP per Entry)."""
+        return self.entry.identity
+"""Structure model for Koffie Strategy 1 (spec sections 8-10, 13, 35).
+
+DATA AND PURE DEFINITIONS ONLY. This module contains no engine, no BOS
+detection, no CHOCH detection, and no liquidity, zone, entry, risk, news,
+TP/SL or execution logic. A later StructureEngine will maintain a
+`StructureSnapshot`; a later BOS/CHOCH component will decide when the
+protected swing is broken and ask the engine to enter REVALUATING.
+
+Definitions used (all from consecutive CONFIRMED structural swings, never
+raw historical extremes; "active" = most recently confirmed of that type):
+
+    HH = active high > prior high      LH = active high < prior high
+    HL = active low  > prior low       LL = active low  < prior low
+
+Equal prices qualify as none of HH/LH/HL/LL (they are EQUAL).
+
+    BULLISH pair  = HH + HL
+    BEARISH pair  = LL + LH
+    any other combination (mixed or tied) is NOT a directional pair.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.swing import Swing, SwingType
+
+
+# ---------------------------------------------------------------------------
+# Enumerations
+# ---------------------------------------------------------------------------
+class DirectionalPermission(Enum):
+    LONG_ONLY = "LONG_ONLY"
+    SHORT_ONLY = "SHORT_ONLY"
+    NO_TRADE_PERMITTED = "NO_TRADE_PERMITTED"
+
+
+class StructureState(Enum):
+    UNDETERMINED = "UNDETERMINED"
+    BULLISH = "BULLISH"
+    BEARISH = "BEARISH"
+    REVALUATING = "REVALUATING"
+
+    @property
+    def permission(self) -> DirectionalPermission:
+        """Directional permission this state grants (spec sections 2 and 35)."""
+        return _PERMISSIONS[self]
+
+
+_PERMISSIONS = {
+    StructureState.BULLISH: DirectionalPermission.LONG_ONLY,
+    StructureState.BEARISH: DirectionalPermission.SHORT_ONLY,
+    StructureState.REVALUATING: DirectionalPermission.NO_TRADE_PERMITTED,
+    StructureState.UNDETERMINED: DirectionalPermission.NO_TRADE_PERMITTED,
+}
+
+
+class HighRelation(Enum):
+    HH = "HH"          # active high > prior high
+    LH = "LH"          # active high < prior high
+    EQUAL = "EQUAL"    # ties qualify as neither
+
+
+class LowRelation(Enum):
+    HL = "HL"          # active low > prior low
+    LL = "LL"          # active low < prior low
+    EQUAL = "EQUAL"    # ties qualify as neither
+
+
+class TransitionReason(Enum):
+    DIRECTIONAL_PAIR = "DIRECTIONAL_PAIR"   # swing-pair evaluation set BULLISH/BEARISH
+    CHOCH = "CHOCH"                         # protected swing broken -> REVALUATING
+
+
+# ---------------------------------------------------------------------------
+# Pure definitions
+# ---------------------------------------------------------------------------
+def _require_swing(swing: Swing, swing_type: SwingType, name: str) -> None:
+    if not isinstance(swing, Swing):
+        raise ValueError(f"{name} must be a Swing")
+    if swing.swing_type is not swing_type:
+        raise ValueError(f"{name} must be a {swing_type.value} swing")
+
+
+def compare_highs(active: Swing, prior: Swing) -> HighRelation:
+    _require_swing(active, SwingType.HIGH, "active")
+    _require_swing(prior, SwingType.HIGH, "prior")
+    if active.price > prior.price:
+        return HighRelation.HH
+    if active.price < prior.price:
+        return HighRelation.LH
+    return HighRelation.EQUAL
+
+
+def compare_lows(active: Swing, prior: Swing) -> LowRelation:
+    _require_swing(active, SwingType.LOW, "active")
+    _require_swing(prior, SwingType.LOW, "prior")
+    if active.price > prior.price:
+        return LowRelation.HL
+    if active.price < prior.price:
+        return LowRelation.LL
+    return LowRelation.EQUAL
+
+
+def classify_pair(
+    high_relation: Optional[HighRelation],
+    low_relation: Optional[LowRelation],
+) -> Optional[StructureState]:
+    """BULLISH for HH+HL, BEARISH for LL+LH, otherwise None (no direction).
+
+    None means "not a directional pair": mixed (HH+LL, LH+HL), tied, or
+    incomplete. It never means UNDETERMINED; the caller leaves its current
+    state unchanged.
+    """
+    if high_relation is HighRelation.HH and low_relation is LowRelation.HL:
+        return StructureState.BULLISH
+    if low_relation is LowRelation.LL and high_relation is HighRelation.LH:
+        return StructureState.BEARISH
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Snapshot
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StructureSnapshot:
+    """Immutable picture of one timeframe's structure at one moment.
+
+    BULLISH, BEARISH and REVALUATING require two confirmed highs AND two
+    confirmed lows (spec section 8; REVALUATING only follows an established
+    trend). UNDETERMINED may hold any swings, because a mixed or tied pair
+    leaves the state unchanged.
+    """
+
+    timeframe: Timeframe
+    state: StructureState = StructureState.UNDETERMINED
+    active_swing_high: Optional[Swing] = None
+    prior_swing_high: Optional[Swing] = None
+    active_swing_low: Optional[Swing] = None
+    prior_swing_low: Optional[Swing] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if not isinstance(self.state, StructureState):
+            raise ValueError("state must be a StructureState")
+
+        slots = (
+            ("active_swing_high", self.active_swing_high, SwingType.HIGH),
+            ("prior_swing_high", self.prior_swing_high, SwingType.HIGH),
+            ("active_swing_low", self.active_swing_low, SwingType.LOW),
+            ("prior_swing_low", self.prior_swing_low, SwingType.LOW),
+        )
+        for name, swing, swing_type in slots:
+            if swing is None:
+                continue
+            _require_swing(swing, swing_type, name)
+            if swing.timeframe is not self.timeframe:
+                raise ValueError(f"{name} belongs to a different timeframe")
+
+        for kind, active, prior in (
+            ("high", self.active_swing_high, self.prior_swing_high),
+            ("low", self.active_swing_low, self.prior_swing_low),
+        ):
+            if prior is None:
+                continue
+            if active is None:
+                raise ValueError(f"prior swing {kind} requires an active swing {kind}")
+            if not (prior.sequence < active.sequence and prior.candle_time < active.candle_time):
+                raise ValueError(
+                    f"prior swing {kind} must be confirmed chronologically before the active one"
+                )
+
+        if self.state is not StructureState.UNDETERMINED and not self.has_two_highs_and_two_lows:
+            raise ValueError(
+                f"{self.state.value} requires two confirmed swing highs and two confirmed swing lows"
+            )
+
+    # -- availability -------------------------------------------------------
+    @property
+    def has_two_highs_and_two_lows(self) -> bool:
+        return self.prior_swing_high is not None and self.prior_swing_low is not None
+
+    # -- relationships between consecutive confirmed swings ---------------------
+    @property
+    def high_relation(self) -> Optional[HighRelation]:
+        if self.active_swing_high is None or self.prior_swing_high is None:
+            return None
+        return compare_highs(self.active_swing_high, self.prior_swing_high)
+
+    @property
+    def low_relation(self) -> Optional[LowRelation]:
+        if self.active_swing_low is None or self.prior_swing_low is None:
+            return None
+        return compare_lows(self.active_swing_low, self.prior_swing_low)
+
+    @property
+    def directional_pair(self) -> Optional[StructureState]:
+        """BULLISH (HH+HL), BEARISH (LL+LH) or None, from the held swings."""
+        return classify_pair(self.high_relation, self.low_relation)
+
+    # -- protected swing (spec section 10) -----------------------------------
+    @property
+    def protected_swing(self) -> Optional[Swing]:
+        """Active low if BULLISH, active high if BEARISH, else undefined (None)."""
+        if self.state is StructureState.BULLISH:
+            return self.active_swing_low
+        if self.state is StructureState.BEARISH:
+            return self.active_swing_high
+        return None
+
+    # -- permission (spec sections 2 and 35) ------------------------------------
+    @property
+    def permission(self) -> DirectionalPermission:
+        return self.state.permission
+
+
+# ---------------------------------------------------------------------------
+# Transition record (auditability, spec section 39)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StructureTransition:
+    """Immutable record that the structure state changed.
+
+    DIRECTIONAL_PAIR: swing-pair evaluation set BULLISH or BEARISH;
+        `trigger_swing_sequence` is the newest swing that was evaluated and
+        `at` is normally that swing's confirmed_at.
+    CHOCH: the protected swing was broken while BULLISH/BEARISH, entering
+        REVALUATING; it is caused by a candle, not a swing, so
+        `trigger_swing_sequence` must be None.
+    """
+
+    timeframe: Timeframe
+    from_state: StructureState
+    to_state: StructureState
+    reason: TransitionReason
+    at: datetime
+    trigger_swing_sequence: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if not isinstance(self.from_state, StructureState):
+            raise ValueError("from_state must be a StructureState")
+        if not isinstance(self.to_state, StructureState):
+            raise ValueError("to_state must be a StructureState")
+        if not isinstance(self.reason, TransitionReason):
+            raise ValueError("reason must be a TransitionReason")
+        if not isinstance(self.at, datetime):
+            raise ValueError("at must be a datetime")
+        if self.from_state is self.to_state:
+            raise ValueError("a transition must change the state")
+
+        directional = (StructureState.BULLISH, StructureState.BEARISH)
+        seq = self.trigger_swing_sequence
+        if self.reason is TransitionReason.DIRECTIONAL_PAIR:
+            if self.to_state not in directional:
+                raise ValueError("a directional-pair transition must end BULLISH or BEARISH")
+            if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+                raise ValueError("a directional-pair transition needs a swing sequence >= 0")
+        else:  # CHOCH
+            if self.from_state not in directional:
+                raise ValueError("CHOCH can only occur from BULLISH or BEARISH")
+            if self.to_state is not StructureState.REVALUATING:
+                raise ValueError("CHOCH must enter REVALUATING")
+            if seq is not None:
+                raise ValueError("a CHOCH transition has no trigger swing")
+"""Sweep model for Koffie Strategy 1.
+ 
+A Sweep records that ONE completed 5M candle penetrated the required liquidity
+level of ONE zone:
+ 
+    DEMAND zone: the candle's LOW  is strictly BELOW the liquidity level
+    SUPPLY zone: the candle's HIGH is strictly ABOVE the liquidity level
+ 
+Strict means a wick that only reaches the level exactly is NOT a sweep. A wick
+is sufficient: the candle does NOT have to close beyond the level, and where the
+candle closes is irrelevant to the sweep itself.
+ 
+Single source of truth
+----------------------
+A Sweep stores exactly three fields: the `Zone`, the `LiquidityLevel` and the
+sweeping `Candle`. Everything else is derived from them:
+ 
+    Sweep -> Zone -> Pivot -> BOS -> broken structural swing
+    Sweep -> LiquidityLevel -> Swing
+    Sweep -> Candle
+ 
+The whole candle is kept (not just a price) so later components can read its
+high and low; this module itself uses no SL/TP.
+ 
+Causality (validated on construction)
+-------------------------------------
+- the candle and the level are both 5M;
+- the level is relevant to the zone (LiquidityLevel.is_relevant_to);
+- the level was already known when the candle OPENED
+  (`level.known_at <= candle.open_time`);
+- the zone was already known when the candle OPENED
+  (`zone.created_at <= candle.open_time`);
+- the candle's wick penetrates the level strictly.
+ 
+A Sweep is known only when its candle has CLOSED (`known_at` = candle close time).
+ 
+Identity
+--------
+One sweep exists per (zone, liquidity level) pair: `SweepIdentity`. Which candle
+produced it is NOT part of the identity.
+ 
+This module is DATA ONLY. It contains no zone-touch logic, no setup,
+confirmation, entry, SL/TP, risk, news or execution logic, no BOS/CHOCH, no
+tolerance, distance limit, ATR, displacement or other filter, and no flag of
+any kind.
+"""
+from __future__ import annotations
+ 
+from dataclasses import dataclass
+from datetime import datetime
+ 
+from koffie.strategy.models.candle import Candle, Timeframe
+from koffie.strategy.models.liquidity import LiquidityIdentity, LiquidityLevel
+from koffie.strategy.models.pivot import BOSIdentity
+from koffie.strategy.models.zone import Zone, ZoneType
+ 
+ 
+def penetrates(zone: Zone, level: LiquidityLevel, candle: Candle) -> bool:
+    """True when the candle's wick goes strictly beyond the liquidity level.
+ 
+    DEMAND: candle.low < level.price.   SUPPLY: candle.high > level.price.
+    Pure check: it does not look at times, timeframes or relevance.
+    """
+    if not isinstance(zone, Zone):
+        raise TypeError("zone must be a Zone")
+    if not isinstance(level, LiquidityLevel):
+        raise TypeError("level must be a LiquidityLevel")
+    if not isinstance(candle, Candle):
+        raise TypeError("candle must be a Candle")
+    if zone.zone_type is ZoneType.DEMAND:
+        return candle.low < level.price
+    return candle.high > level.price
+ 
+ 
+@dataclass(frozen=True)
+class SweepIdentity:
+    """Identity of one sweep: the zone's BOS identity plus the level's identity."""
+ 
+    zone_identity: BOSIdentity
+    liquidity_identity: LiquidityIdentity
+ 
+    @classmethod
+    def from_parts(cls, zone: Zone, level: LiquidityLevel) -> "SweepIdentity":
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(level, LiquidityLevel):
+            raise TypeError("level must be a LiquidityLevel")
+        return cls(zone_identity=zone.identity, liquidity_identity=level.identity)
+ 
+ 
+@dataclass(frozen=True)
+class Sweep:
+    """Immutable record of one completed 5M candle sweeping a zone's liquidity."""
+ 
+    zone: Zone
+    level: LiquidityLevel
+    candle: Candle
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.zone, Zone):
+            raise ValueError("zone must be a Zone")
+        if not isinstance(self.level, LiquidityLevel):
+            raise ValueError("level must be a LiquidityLevel")
+        if not isinstance(self.candle, Candle):
+            raise ValueError("candle must be a Candle")
+        if self.candle.timeframe is not Timeframe.M5:
+            raise ValueError("a sweep is made by a 5M candle")
+        if self.level.timeframe is not Timeframe.M5:
+            raise ValueError("a sweep is of 5M liquidity")
+        if not self.level.is_relevant_to(self.zone):
+            raise ValueError("the liquidity level is not relevant to this zone")
+        if self.candle.open_time < self.level.known_at:
+            raise ValueError("the liquidity level was not known yet when the candle opened")
+        if self.candle.open_time < self.zone.created_at:
+            raise ValueError("the zone was not known yet when the candle opened")
+        if not penetrates(self.zone, self.level, self.candle):
+            raise ValueError("the candle's wick does not penetrate strictly beyond the liquidity level")
+ 
+    # -- derived values -------------------------------------------------------------
+    @property
+    def zone_type(self) -> ZoneType:
+        return self.zone.zone_type
+ 
+    @property
+    def swept_price(self) -> float:
+        """The liquidity level's price."""
+        return self.level.price
+ 
+    @property
+    def candle_time(self) -> datetime:
+        """Open time of the sweeping candle."""
+        return self.candle.open_time
+ 
+    @property
+    def known_at(self) -> datetime:
+        """The sweep is known only once its candle has closed."""
+        return self.candle.close_time
+ 
+    def is_known_at(self, moment: datetime) -> bool:
+        """True only from `known_at` onward.
+ 
+        Raises TypeError if `moment` is not a datetime (and, as for any datetime
+        comparison, if it mixes naive and timezone-aware values).
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.known_at
+ 
+    @property
+    def identity(self) -> SweepIdentity:
+        return SweepIdentity.from_parts(self.zone, self.level)
+"""Swing model for Koffie Strategy 1 (spec sections 4-7).
+ 
+A `Swing` is a CONFIRMED swing: a candle N that satisfied the 3-candle rule
+and whose right-hand neighbour N+1 has since CLOSED. Unconfirmed candidates
+are not represented by this model.
+ 
+Every confirmed local swing is automatically a structural swing (spec
+section 6), so there is one model, not separate local/structural ones.
+ 
+This module holds data only. It contains no swing detection, structure
+classification, BOS/CHOCH, liquidity, zones, BRR or trading logic.
+"""
+from __future__ import annotations
+ 
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+ 
+from koffie.strategy.models.candle import Timeframe
+ 
+ 
+class SwingType(Enum):
+    HIGH = "HIGH"
+    LOW = "LOW"
+ 
+ 
+@dataclass(frozen=True)
+class Swing:
+    """An immutable, confirmed structural swing.
+ 
+    swing_type    HIGH or LOW
+    timeframe     timeframe the swing was found on
+    price         the swing candle's high (HIGH) or low (LOW)
+    candle_time   open_time of the swing candle N
+    confirmed_at  close_time of the confirmation candle N+1, i.e. the first
+                  moment the swing was knowable
+    sequence      chronological confirmation order (0, 1, 2, ...)
+ 
+    Causal invariant: candle N+1 begins no earlier than N's close and lasts a
+    full timeframe, so confirmed_at >= candle_time + 2 * timeframe.duration.
+    Gaps between candles (weekends, holidays) make it later, never earlier.
+    """
+ 
+    swing_type: SwingType
+    timeframe: Timeframe
+    price: float
+    candle_time: datetime
+    confirmed_at: datetime
+    sequence: int
+ 
+    def __post_init__(self) -> None:
+        if not isinstance(self.swing_type, SwingType):
+            raise ValueError("swing_type must be a SwingType")
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError("timeframe must be a Timeframe")
+        if isinstance(self.price, bool) or not isinstance(self.price, (int, float)):
+            raise ValueError("price must be a number")
+        if not math.isfinite(self.price):
+            raise ValueError("price must be finite")
+        if not isinstance(self.candle_time, datetime):
+            raise ValueError("candle_time must be a datetime")
+        if not isinstance(self.confirmed_at, datetime):
+            raise ValueError("confirmed_at must be a datetime")
+        if isinstance(self.sequence, bool) or not isinstance(self.sequence, int):
+            raise ValueError("sequence must be an int")
+        if self.sequence < 0:
+            raise ValueError("sequence must be >= 0")
+        if (self.candle_time.tzinfo is None) != (self.confirmed_at.tzinfo is None):
+            raise ValueError(
+                "candle_time and confirmed_at must both be naive or both timezone-aware"
+            )
+        if self.confirmed_at < self.candle_time + 2 * self.timeframe.duration:
+            raise ValueError(
+                "confirmed_at cannot precede the close of the confirmation candle "
+                "(candle_time + 2 * timeframe duration)"
+            )
+ 
+    @property
+    def is_high(self) -> bool:
+        return self.swing_type is SwingType.HIGH
+ 
+    @property
+    def is_low(self) -> bool:
+        return self.swing_type is SwingType.LOW
+"""Zone model for Koffie Strategy 1.
+
+A Zone is the supply/demand area created by a confirmed BOS that has a Pivot:
+
+    bullish BOS + Pivot -> DEMAND zone
+    bearish BOS + Pivot -> SUPPLY zone
+
+The Zone keeps the Pivot candle's ENTIRE range (full wick-to-wick high and
+low). There is NO buffer of any kind (no pip, ATR, percentage, body-only,
+spread or volatility adjustment). The boundaries never move.
+
+Single source of truth
+----------------------
+A Zone stores exactly ONE field: the `Pivot`. Everything else is derived from
+it, so nothing can drift out of sync and no independent mutable copy exists:
+
+    Zone -> Pivot -> BOS -> broken structural swing
+
+Two different times (do not confuse them)
+-----------------------------------------
+origin_time   open_time of the historical PIVOT CANDLE the price range comes from.
+created_at    when the BOS confirmed the zone (the BOS candle's close). This is
+              the first moment the zone is known/usable. Downstream logic must
+              NOT treat the zone as existing or usable before `created_at`,
+              even though its price range comes from an earlier candle.
+              `is_known_at(moment)` states this rule in one place.
+
+A zone existing is NOT entry eligibility, setup validity or execution
+permission; those belong to later components.
+
+This module is DATA ONLY. It contains no search, touch, mitigation,
+invalidation, merging, ranking, liquidity, setup, entry, SL/TP, risk, news or
+execution logic, and no `consumed_for_entry` flag.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+
+from koffie.strategy.models.bos import BOS, BOSDirection
+from koffie.strategy.models.candle import Timeframe
+from koffie.strategy.models.pivot import BOSIdentity, Pivot
+from koffie.strategy.models.swing import Swing
+
+
+class ZoneType(Enum):
+    DEMAND = "DEMAND"
+    SUPPLY = "SUPPLY"
+
+
+# Bullish BOS -> DEMAND, bearish BOS -> SUPPLY.
+ZONE_TYPE_FOR_DIRECTION = {
+    BOSDirection.BULLISH: ZoneType.DEMAND,
+    BOSDirection.BEARISH: ZoneType.SUPPLY,
+}
+
+
+@dataclass(frozen=True)
+class Zone:
+    """Immutable supply/demand zone, derived entirely from its Pivot."""
+
+    pivot: Pivot
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pivot, Pivot):
+            raise ValueError("pivot must be a Pivot")
+
+    # -- what kind of zone, where, on which timeframe ---------------------------
+    @property
+    def zone_type(self) -> ZoneType:
+        return ZONE_TYPE_FOR_DIRECTION[self.pivot.bos.direction]
+
+    @property
+    def timeframe(self) -> Timeframe:
+        return self.pivot.bos.timeframe
+
+    @property
+    def high(self) -> float:
+        """Pivot candle HIGH (full wick), no buffer."""
+        return self.pivot.high
+
+    @property
+    def low(self) -> float:
+        """Pivot candle LOW (full wick), no buffer."""
+        return self.pivot.low
+
+    # -- the two times ----------------------------------------------------------
+    @property
+    def origin_time(self) -> datetime:
+        """Open time of the Pivot candle the price range comes from."""
+        return self.pivot.candle_time
+
+    @property
+    def created_at(self) -> datetime:
+        """When the BOS confirmed the zone: the zone is not known before this."""
+        return self.pivot.bos.confirmed_at
+
+    def is_known_at(self, moment: datetime) -> bool:
+        """True only from `created_at` onward; never at or before `origin_time`
+        merely because the Pivot candle already existed.
+
+        Raises TypeError if `moment` is not a datetime (and, as for any datetime
+        comparison, if it mixes naive and timezone-aware values).
+        """
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        return moment >= self.created_at
+
+    # -- provenance: Zone -> Pivot -> BOS -> broken structural swing ---------------
+    @property
+    def bos(self) -> BOS:
+        return self.pivot.bos
+
+    @property
+    def broken_swing(self) -> Swing:
+        return self.pivot.bos.broken_swing
+
+    @property
+    def identity(self) -> BOSIdentity:
+        """Identity of the BOS that created this zone."""
+        return BOSIdentity.from_bos(self.pivot.bos)

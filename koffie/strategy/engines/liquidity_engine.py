@@ -35,13 +35,14 @@ nothing.
 """
 from __future__ import annotations
  
+from bisect import bisect_right
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
  
 from koffie.strategy.models.candle import Timeframe
 from koffie.strategy.models.liquidity import LiquidityIdentity, LiquidityLevel
-from koffie.strategy.models.swing import Swing
-from koffie.strategy.models.zone import Zone
+from koffie.strategy.models.swing import Swing, SwingType
+from koffie.strategy.models.zone import Zone, ZoneType
  
  
 class LiquidityEngine:
@@ -53,6 +54,18 @@ class LiquidityEngine:
         self._timeframe = timeframe
         self._levels: List[LiquidityLevel] = []                    # append-only, acceptance order
         self._by_identity: Dict[LiquidityIdentity, LiquidityLevel] = {}
+
+        # ------------------------------------------------------------------
+        # Acceleration index for required_liquidity_for (EXACT same result).
+        # known_at is non-decreasing in acceptance order (process_swing
+        # enforces it), so all levels known at a moment form a prefix of
+        # _levels. The trees find the rightmost relevant position of that
+        # prefix in O(log n) instead of scanning every level.
+        # ------------------------------------------------------------------
+        self._known_ats: List[datetime] = []
+        self._cap = 0                                              # leaf capacity (power of two)
+        self._low_min: List[float] = []
+        self._high_max: List[float] = []
  
     # ------------------------------------------------------------- read-only state
     @property
@@ -90,14 +103,113 @@ class LiquidityEngine:
  
     def required_liquidity_for(self, zone: Zone, moment: datetime) -> Optional[LiquidityLevel]:
         """The newest relevant known level, or None.
- 
+
         Newest = latest `known_at`, then the highest swing `sequence`.
+        Identical result to scanning levels_for(zone, moment); the segment-tree
+        index finds the same level in O(log n) because known_at is
+        non-decreasing in acceptance order.
         """
-        candidates = self.levels_for(zone, moment)
-        if not candidates:
+        if not isinstance(zone, Zone):
+            raise TypeError("zone must be a Zone")
+        if not isinstance(moment, datetime):
+            raise TypeError("moment must be a datetime")
+        if not self._levels:
             return None
-        return max(candidates, key=lambda level: (level.known_at, level.sequence))
- 
+        # rightmost acceptance position whose level was already known at moment
+        last = bisect_right(self._known_ats, moment) - 1
+        if last < 0:
+            return None
+        if zone.zone_type is ZoneType.DEMAND:      # LOW strictly below zone.low
+            found = self._rightmost_low(1, 0, self._cap, last, zone.low)
+            relevant = self._low_is_relevant
+        else:                                      # SUPPLY: HIGH strictly above zone.high
+            found = self._rightmost_high(1, 0, self._cap, last, zone.high)
+            relevant = self._high_is_relevant
+        if found < 0:
+            return None
+        # Exact tie-break, identical to the old max by (known_at, sequence):
+        # every candidate that can win has the SAME known_at as the found
+        # level (a smaller known_at always loses); within that equal-known_at
+        # run the highest sequence wins, regardless of acceptance order.
+        best = found
+        run_known_at = self._known_ats[found]
+        position = found - 1
+        while position >= 0 and self._known_ats[position] == run_known_at:
+            if (relevant(zone, self._levels[position])
+                    and self._levels[position].sequence > self._levels[best].sequence):
+                best = position
+            position -= 1
+        return self._levels[best]
+
+    @staticmethod
+    def _low_is_relevant(zone: Zone, level: LiquidityLevel) -> bool:
+        return level.swing.swing_type is SwingType.LOW and level.price < zone.low
+
+    @staticmethod
+    def _high_is_relevant(zone: Zone, level: LiquidityLevel) -> bool:
+        return level.swing.swing_type is SwingType.HIGH and level.price > zone.high
+
+    # ------------------------------------------------------------- index internals
+    def _grow(self, position: int) -> None:
+        """Double the tree leaf capacity until `position` fits; rebuild from _levels."""
+        cap = max(1, self._cap)
+        while position >= cap:
+            cap *= 2
+        base = cap
+        self._low_min = [float("inf")] * (2 * base)
+        self._high_max = [float("-inf")] * (2 * base)
+        for i, level in enumerate(self._levels):
+            node = base + i
+            if level.swing.swing_type is SwingType.LOW:
+                self._low_min[node] = level.price
+            else:
+                self._high_max[node] = level.price
+        for node in range(base - 1, 0, -1):
+            self._low_min[node] = min(self._low_min[2 * node], self._low_min[2 * node + 1])
+            self._high_max[node] = max(self._high_max[2 * node], self._high_max[2 * node + 1])
+        self._cap = cap
+
+    def _index_append(self, level: LiquidityLevel) -> None:
+        """Insert one accepted level into both trees (point update)."""
+        position = len(self._known_ats)
+        if position >= self._cap:
+            self._grow(position)
+        self._known_ats.append(level.known_at)
+        node = self._cap + position
+        if level.swing.swing_type is SwingType.LOW:
+            self._low_min[node] = level.price
+        else:
+            self._high_max[node] = level.price
+        node //= 2
+        while node:
+            self._low_min[node] = min(self._low_min[2 * node], self._low_min[2 * node + 1])
+            self._high_max[node] = max(self._high_max[2 * node], self._high_max[2 * node + 1])
+            node //= 2
+
+    def _rightmost_low(self, node: int, lo: int, hi: int, last: int, bound: float) -> int:
+        """Rightmost acceptance position <= last whose LOW price is strictly < bound, else -1."""
+        if lo > last or self._low_min[node] >= bound:
+            return -1
+        if hi - lo == 1:
+            return lo
+        mid = (lo + hi) // 2
+        found = self._rightmost_low(2 * node + 1, mid, hi, last, bound)
+        if found >= 0:
+            return found
+        return self._rightmost_low(2 * node, lo, mid, last, bound)
+
+    def _rightmost_high(self, node: int, lo: int, hi: int, last: int, bound: float) -> int:
+        """Rightmost acceptance position <= last whose HIGH price is strictly > bound, else -1."""
+        if lo > last or self._high_max[node] <= bound:
+            return -1
+        if hi - lo == 1:
+            return lo
+        mid = (lo + hi) // 2
+        found = self._rightmost_high(2 * node + 1, mid, hi, last, bound)
+        if found >= 0:
+            return found
+        return self._rightmost_high(2 * node, lo, mid, last, bound)
+
     # --------------------------------------------------------------------- input
     def process_swing(self, swing: Swing, now: datetime) -> LiquidityLevel:
         """Accept one confirmed swing and return its LiquidityLevel.
@@ -136,4 +248,5 @@ class LiquidityEngine:
         # Commit only after validation and construction succeeded.
         self._levels.append(level)
         self._by_identity[identity] = level
+        self._index_append(level)
         return level
