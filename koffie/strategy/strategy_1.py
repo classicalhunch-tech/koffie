@@ -14,7 +14,7 @@ whether a confirmed Setup may become a trade.
                    (its own private SweepEngine / ConfirmationEngine do the sweep and
                     the post-sweep confirmation)
                 -> EntryEngine              -> Entry (price = close of the confirming candle)
-                -> SLTPEngine               -> SL (sweep candle low/high) and TP (exactly 2R)
+                -> SLTPEngine               -> SL (sweep candle low/high + optional ATR widening) and TP (exactly 2R)
  
 Directional permission (H1 only)
 --------------------------------
@@ -48,6 +48,14 @@ several zones are confirmed by the same candle they are tried in the existing
 `tie_break_order`; zone consumption and the one-trade-per-causal-event rule are
 enforced by SetupEngine.can_create_trade, not here.
  
+ATR Stop Widening (optional)
+----------------------------
+When stop_atr_mult > 0, stops are widened beyond the zone edge by
+stop_atr_mult × ATR(14) known at entry time:
+  - LONG: stop moves lower (wider risk)
+  - SHORT: stop moves higher (wider risk)
+This accounts for volatility and is optional (default: 0, no widening).
+
 Not in this module: H4, spread, order flow, volume, risk, position sizing, news,
 execution, flip zones, Strategy 2, or any rule that an engine does not already own.
 Call `process_candle(candle, now)` with `now = candle.close_time` when replaying history.
@@ -58,7 +66,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
  
+from koffie.strategy.atr import known_atr
 from koffie.strategy.engines.entry_engine import EntryEngine
 from koffie.strategy.engines.liquidity_engine import LiquidityEngine
 from koffie.strategy.engines.pivot_engine import PivotEngine
@@ -178,7 +189,31 @@ class Strategy1Result:
  
  
 class Strategy1:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        historical_data: Optional[pd.DataFrame] = None,
+        stop_atr_mult: float = 0.0,
+    ) -> None:
+        """Initialize Strategy1 with optional ATR stop-widening.
+        
+        Args:
+            historical_data: Optional DataFrame with OHLC data (indexed by timestamp)
+                           Required if stop_atr_mult > 0
+            stop_atr_mult: Multiplier for ATR-based stop widening (0.0 = no widening)
+        """
+        if stop_atr_mult < 0:
+            raise ValueError("stop_atr_mult must be >= 0")
+        
+        if stop_atr_mult > 0 and historical_data is None:
+            raise ValueError(
+                "historical_data (DataFrame with OHLC) is required when stop_atr_mult > 0"
+            )
+        
+        # Compute causal ATR if stop widening is enabled
+        atr_series = None
+        if stop_atr_mult > 0 and historical_data is not None:
+            atr_series = known_atr(historical_data, period=14)
+        
         self._h1 = StructureProcessor(Timeframe.H1)
         self._m15 = StructureProcessor(Timeframe.M15)
         self._pivots = PivotEngine(Timeframe.M15)
@@ -187,7 +222,11 @@ class Strategy1:
         self._liquidity = LiquidityEngine(Timeframe.M5)
         self._setups = SetupEngine(self._liquidity)
         self._entries = EntryEngine(self._setups)
-        self._sl_tps = SLTPEngine(self._entries)
+        self._sl_tps = SLTPEngine(
+            self._entries,
+            atr_series=atr_series,
+            stop_atr_mult=stop_atr_mult,
+        )
         self._trades: List[Strategy1Trade] = []
         self._last_key: Optional[Tuple[datetime, int]] = None
         self._last_candle: Dict[Timeframe, Candle] = {}
@@ -308,7 +347,7 @@ class Strategy1:
             self._zone_cache.append(
                 (zone.created_at, zone, zone.zone_type is ZoneType.DEMAND, zone.low, zone.high)
             )
-
+ 
     def _on_m5(self, candle: Candle, now: datetime) -> Strategy1Result:
         # 1. liquidity: swings confirmed by this candle become known at its close, so the
         #    SweepEngine (which selects liquidity as of the candle OPEN) cannot use them yet.

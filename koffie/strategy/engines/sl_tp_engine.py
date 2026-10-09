@@ -12,7 +12,8 @@ Locked behaviour
 - SL/TP never reads zones, liquidity levels, pivots, protected swings, or
   opposite zones. The only references are the Entry, its Confirmation, its
   Sweep, and the Sweep's candle.
-- No buffer, no offset, no ATR, no spread, no execution, no MT5, no news.
+- Optional ATR-based stop widening: if stop_atr_mult > 0, widen stops beyond
+  the zone edge by stop_atr_mult × ATR(14) known at entry time.
 
 If an EntryEngine is injected, process(now) creates SLTPs for all Entries
 known at now. Otherwise create_sl_tp(entry, now) is the only entry point.
@@ -20,6 +21,7 @@ known at now. Otherwise create_sl_tp(entry, now) is the only entry point.
 
 from __future__ import annotations
 
+import pandas as pd
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -29,11 +31,37 @@ from koffie.strategy.models.sl_tp import SLTP
 
 
 class SLTPEngine:
-    def __init__(self, entry_engine: Optional[EntryEngine] = None) -> None:
+    def __init__(
+        self,
+        entry_engine: Optional[EntryEngine] = None,
+        atr_series: Optional[pd.Series] = None,
+        stop_atr_mult: float = 0.0,
+    ) -> None:
+        """Initialize SLTPEngine with optional ATR stop-widening.
+        
+        Args:
+            entry_engine: Optional EntryEngine to auto-create SLTPs
+            atr_series: Optional pd.Series indexed by timestamp with ATR(14) values
+            stop_atr_mult: Multiplier for ATR-based stop widening (0.0 = no widening)
+                          Requires atr_series if > 0
+        """
         if entry_engine is not None and not isinstance(entry_engine, EntryEngine):
             raise TypeError("entry_engine must be an EntryEngine or None")
+        
+        if stop_atr_mult < 0:
+            raise ValueError("stop_atr_mult must be >= 0")
+        
+        if stop_atr_mult > 0 and atr_series is None:
+            raise ValueError(
+                "atr_series is required when stop_atr_mult > 0"
+            )
+        
+        if atr_series is not None and not isinstance(atr_series, pd.Series):
+            raise TypeError("atr_series must be a pd.Series or None")
 
         self._entry_engine = entry_engine
+        self._atr_series = atr_series
+        self._stop_atr_mult = stop_atr_mult
         self._sl_tps: List[SLTP] = []
         self._by_entry: Dict[object, SLTP] = {}
 
@@ -42,6 +70,14 @@ class SLTPEngine:
     @property
     def entry_engine(self) -> Optional[EntryEngine]:
         return self._entry_engine
+    
+    @property
+    def atr_series(self) -> Optional[pd.Series]:
+        return self._atr_series
+    
+    @property
+    def stop_atr_mult(self) -> float:
+        return self._stop_atr_mult
 
     @property
     def sl_tps(self) -> Tuple[SLTP, ...]:
@@ -66,6 +102,23 @@ class SLTPEngine:
         )
 
     # --------------------------------------------------------------------- input
+    
+    def _get_atr_at_time(self, timestamp: datetime) -> Optional[float]:
+        """Get causal ATR value (known at this timestamp's open).
+        
+        Returns None if atr_series is not available or no value exists.
+        """
+        if self._atr_series is None:
+            return None
+        
+        try:
+            # Use asof() to get the most recent known value up to this timestamp
+            atr_val = self._atr_series.asof(timestamp)
+            if pd.isna(atr_val):
+                return None
+            return float(atr_val)
+        except (KeyError, IndexError, TypeError):
+            return None
 
     def create_sl_tp(self, entry: Entry, now: datetime) -> SLTP:
         """Create or return the SLTP for one Entry.
@@ -87,7 +140,21 @@ class SLTPEngine:
         if existing is not None:
             return existing
 
-        sl_tp = SLTP(entry)
+        # Get ATR value if stop widening is enabled
+        atr_val = None
+        if self._stop_atr_mult > 0:
+            atr_val = self._get_atr_at_time(entry.known_at)
+            if atr_val is None:
+                raise ValueError(
+                    f"ATR value not available at entry time {entry.known_at} "
+                    f"(required for stop_atr_mult={self._stop_atr_mult})"
+                )
+
+        sl_tp = SLTP(
+            entry=entry,
+            atr_value=atr_val,
+            stop_atr_mult=self._stop_atr_mult,
+        )
 
         # Commit only after construction succeeded.
         self._sl_tps.append(sl_tp)

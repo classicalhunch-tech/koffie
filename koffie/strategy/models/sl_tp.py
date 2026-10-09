@@ -6,17 +6,26 @@ single Entry.
 Locked rules
 ------------
 BUY / DEMAND (Entry.direction is LONG):
-    SL = exact LOW of the sweep candle:  entry.confirmation.sweep.candle.low
+    Base SL = exact LOW of the sweep candle:  entry.confirmation.sweep.candle.low
+    With ATR widening: SL = sweep.low - (stop_atr_mult * ATR at entry time)
     R  = entry.price - SL
     TP = entry.price + 2 * R
 
 SELL / SUPPLY (Entry.direction is SHORT):
-    SL = exact HIGH of the sweep candle: entry.confirmation.sweep.candle.high
+    Base SL = exact HIGH of the sweep candle: entry.confirmation.sweep.candle.high
+    With ATR widening: SL = sweep.high + (stop_atr_mult * ATR at entry time)
     R  = SL - entry.price
     TP = entry.price - 2 * R
 
-No buffer, no offset, no ATR, no spread, no sweep-range fraction, no
-opposite-zone target, no target-zone search, no fallback. TP is always 1:2.
+ATR widening
+------------
+If stop_atr_mult > 0:
+    Widens the stop beyond the zone edge by stop_atr_mult × ATR(14) known at entry.
+    - LONG: stop moves lower (wider risk)
+    - SHORT: stop moves higher (wider risk)
+
+No buffer, no offset, no spread, no sweep-range fraction, no opposite-zone target,
+no target-zone search, no fallback. TP is always 1:2 (after stop widening if applied).
 
 The Entry price is exactly the close of the confirmation candle (Entry.price).
 
@@ -25,26 +34,50 @@ Geometry is validated: if the SL would be on the wrong side of the Entry
 rather than silently corrected.
 
 This module is DATA ONLY. It contains no risk, position-sizing, execution,
-MT5, news, spread, or broker logic.
+MT5, news, or broker logic.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from typing import Optional
 
 from koffie.strategy.models.entry import Entry, EntryDirection
 
 
 @dataclass(frozen=True)
 class SLTP:
-    """Immutable stop-loss / take-profit pair derived entirely from one Entry."""
+    """Immutable stop-loss / take-profit pair derived entirely from one Entry.
+    
+    Attributes:
+        entry: The Entry this SLTP is derived from
+        atr_value: Optional ATR(14) at entry time for stop widening
+        stop_atr_mult: Multiplier for ATR-based stop widening (0.0 = no widening)
+    """
 
     entry: Entry
+    atr_value: Optional[float] = None
+    stop_atr_mult: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.entry, Entry):
             raise TypeError("entry must be an Entry")
+        
+        if self.stop_atr_mult < 0:
+            raise ValueError("stop_atr_mult must be >= 0")
+        
+        if self.stop_atr_mult > 0 and self.atr_value is None:
+            raise ValueError(
+                "atr_value is required when stop_atr_mult > 0"
+            )
+        
+        if self.stop_atr_mult > 0 and self.atr_value <= 0:
+            raise ValueError(
+                "atr_value must be > 0 for stop widening"
+            )
+        
+        # Validate geometry AFTER computing stop with ATR widening
         if self.direction is EntryDirection.LONG:
             if not self.entry.price > self.stop_loss:
                 raise ValueError(
@@ -73,11 +106,38 @@ class SLTP:
         return self.entry.confirmation.sweep.candle
 
     @property
-    def stop_loss(self) -> float:
-        """BUY: sweep candle low. SELL: sweep candle high."""
+    def base_stop_loss(self) -> float:
+        """Stop loss before ATR widening.
+        
+        BUY: sweep candle low. SELL: sweep candle high.
+        """
         if self.direction is EntryDirection.LONG:
             return self.sweep_candle.low
         return self.sweep_candle.high
+
+    @property
+    def stop_loss(self) -> float:
+        """Stop loss after optional ATR widening.
+        
+        If stop_atr_mult > 0:
+            LONG: stop = base_stop - (stop_atr_mult * ATR)
+            SHORT: stop = base_stop + (stop_atr_mult * ATR)
+        Otherwise:
+            stop = base_stop_loss
+        """
+        base = self.base_stop_loss
+        
+        if self.stop_atr_mult <= 0 or self.atr_value is None:
+            return base
+        
+        atr_adj = self.stop_atr_mult * float(self.atr_value)
+        
+        if self.direction is EntryDirection.LONG:
+            # Widen downward for longs
+            return base - atr_adj
+        else:
+            # Widen upward for shorts
+            return base + atr_adj
 
     @property
     def risk(self) -> float:
